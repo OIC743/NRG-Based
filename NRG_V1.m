@@ -9,7 +9,10 @@
 %  4. BATCH LOOP                  - each file analysed in its own try/catch;
 %                                   a failed file is recorded and skipped
 %
-%  Figures are generated invisibly and written straight to PDF.
+%  Figures are generated invisibly and written straight to PDF. Each test
+%  produces <testID>_CSR<x.xx>_<criterion>_NL<x.xx>.xlsx and a PDF with the
+%  same base name. Figures exported: 01, 02, 05 (gamma_DA only), 06, 07,
+%  09, 14, 19.
 %
 %  FILE NAMING:  CYC161-NT-0-0.66-100-0.15c
 %                 |      |  | |    |   +-- CSR (trailing letter = repeat)
@@ -92,8 +95,8 @@ logf(logFID, '  Criterion     : %s (thresholds: SA %.2f%%, DA %.2f%%, Ru %.2f, G
 logf(logFID, '  Not triggered : report %s\n', upper(config.criteria.onNotTriggered));
 logf(logFID, '  Expert mode   : %s   (stored picks: %d)\n', ...
      config.expert.mode, expertPicks.Count);
-logf(logFID, '  Excel/Figures : %s / %s (%s)\n', onOffStr(config.output.excel), ...
-     onOffStr(config.output.figures), config.output.figureMode);
+logf(logFID, '  Excel/Figures : %s / %s\n', onOffStr(config.output.excel), ...
+     onOffStr(config.output.figures));
 logf(logFID, '  %s\n\n', repmat('=', 1, 76));
 
 %% ======================= 4. BATCH LOOP ===================================
@@ -521,7 +524,6 @@ W_cycle_trapz = zeros(nCompleteCycles, 1);
 W_pos_cycle   = zeros(nCompleteCycles, 1);
 W_neg_cycle   = zeros(nCompleteCycles, 1);
 W_within_cycles     = cell(nCompleteCycles, 1);
-gamma_within_cycles = cell(nCompleteCycles, 1);
 
 for c = 1:nCompleteCycles
     cycleData = AC_complete{c};
@@ -531,7 +533,6 @@ for c = 1:nCompleteCycles
     W_within = cumtrapz(g, tp);
     W_cycle_trapz(c)       = W_within(end);
     W_within_cycles{c}     = W_within;
-    gamma_within_cycles{c} = g;
 
     dGamma  = diff(g);
     tau_avg = (tp(1:end-1) + tp(2:end)) / 2;
@@ -542,8 +543,6 @@ end
 
 W_cumulative_trapz  = cumsum(W_cycle_trapz);
 Wn_cumulative_trapz = cumsum(W_cycle_trapz ./ sigma_v0_Pa);
-W_pos_cumulative    = cumsum(W_pos_cycle);
-W_neg_cumulative    = cumsum(W_neg_cycle);
 
 % Davis & Berrill (2001) energy-based residual pore pressure model:
 %   Ru_res = 1 - exp(Lambda * Wsn),  Wsn = stress-normalized cumulative
@@ -572,9 +571,6 @@ for c = 1:nCompleteCycles
     startIdx_c = endIdx_c + 1;
 end
 cum_abs_gamma_cycle_total = cumsum(cum_abs_gamma_cycle);
-
-backbone_gamma_pos = apex_gamma_a;   backbone_tau_pos = apex_tau_a;
-backbone_gamma_neg = apex_gamma_b;   backbone_tau_neg = apex_tau_b;
 
 % ======================= AUTOMATED CRITERIA =============================
 LiqCriteria = struct();
@@ -842,11 +838,16 @@ if ~liquefied
     if isempty(R.note), R.note = msg; else, R.note = [R.note '; ' msg]; end
 end
 
+% ======================= OUTPUT FILE NAME ===============================
+% One base name shared by the Excel workbook and the figure PDF, so the two
+% outputs of a test always pair up (only the extension differs).
+outBase = sprintf('%s_CSR%.2f_%s_NL%.2f', ...
+                  testID, CSR_liq, config.criteria.primary, N_L_used);
+
 % ======================= EXCEL EXPORT ===================================
 if config.output.excel
 
-    outFile = fullfile(outputDir, sprintf('%s_CSR%.2f_%s_NL_%.2f.xlsx', ...
-                       testID, CSR_liq, config.criteria.primary, N_L_used));
+    outFile = fullfile(outputDir, [outBase '.xlsx']);
 
     Sheet1 = table();
     Sheet1.Cycle          = cycleNumbers;
@@ -1002,8 +1003,7 @@ if config.output.excel
 
     % Per-cycle workbook
     if config.output.perCycleSheets
-        cycleFile = fullfile(outputDir, sprintf('%s_CSR%.2f_CycleData.xlsx', ...
-                             testID, CSR_liq));
+        cycleFile = fullfile(outputDir, [outBase '_CycleData.xlsx']);
         if isfile(cycleFile), delete(cycleFile); end
         for c = 1:nCompleteCycles
             cd_ = AC_complete{c};
@@ -1024,7 +1024,6 @@ end
 % ======================= FIGURES (invisible, saved to PDF) ==============
 if config.output.figures
 
-    isPaper = strcmpi(config.output.figureMode, 'paper');
     colors = struct('blue','#0072BD', 'orange','#D95319', 'green','#77AC30', ...
                     'purple','#7E2F8E', 'teal','#008080', 'red','#A2142F', ...
                     'cyan','#4DBEEE', 'gray',[0.5 0.5 0.5]);
@@ -1106,49 +1105,8 @@ if config.output.figures
     colormap(gca, grayToRed); cb = colorbar; cb.Label.String = 'Cycle'; clim(cbLim)
     grid on; hold off
 
-    % ---- FIG 3: normalized loops ----
-    figs(end+1) = newFigure('Fig03_NormalizedLoops');
-    hold on
-    for c = 1:nC_liq
-        cd_ = AC_complete{c};
-        plot(cd_(:,8), cd_(:,6)./sigma_v0_kPa, 'Color', grayToRed(c,:), 'LineWidth', 1.2)
-    end
-    xline(0, ':k'); yline(0, ':k')
-    xlabel('\gamma (%)','FontSize',16,'FontName',FN)
-    ylabel('\tau / \sigma''_{v0}','FontSize',16,'FontName',FN)
-    title(sprintf('Normalized Stress-Strain Loops | CSR = %.3f', CSR_liq),'FontSize',14)
-    colormap(gca, grayToRed); cb = colorbar; cb.Label.String = 'Cycle'; clim(cbLim)
-    grid on; hold off
-
-    % ---- FIG 4: normalized stress path ----
-    figs(end+1) = newFigure('Fig04_NormalizedStressPath');
-    hold on
-    for c = 1:nC_liq
-        cd_ = AC_complete{c};
-        plot(cd_(:,9)./sigma_v0_kPa, cd_(:,6)./sigma_v0_kPa, ...
-             'Color', grayToRed(c,:), 'LineWidth', 1.2)
-    end
-    xline(0, ':k'); yline(0, ':k')
-    xlabel('\sigma''_v / \sigma''_{v0}','FontSize',16,'FontName',FN)
-    ylabel('\tau / \sigma''_{v0}','FontSize',16,'FontName',FN)
-    title(sprintf('Normalized Effective Stress Path | CSR = %.3f', CSR_liq),'FontSize',14)
-    colormap(gca, grayToRed); cb = colorbar; cb.Label.String = 'Cycle'; clim(cbLim)
-    xlim([0 1.05]); grid on; hold off
-
-    % ---- FIG 5: semi-log Ru and gamma_DA ----
-    figs(end+1) = newFigure('Fig05_SemiLog_Ru_GammaDA');
-    subplot(2,1,1)
-    semilogx(cycleNumbers(1:nC_liq), Ru_atCycle(1:nC_liq), 'o-', ...
-             'Color', colors.blue, 'LineWidth', 1.5, 'MarkerSize', 6, ...
-             'MarkerFaceColor', colors.blue); hold on
-    yline(config.criteria.Ru, '--r', 'LineWidth', 1.5)
-    xline(max(N_L_used, eps), 'r-', 'LineWidth', 2)
-    xlabel('Number of Load Cycles, N_c (log scale)','FontSize',14,'FontName',FN)
-    ylabel('Excess Pore Pressure Ratio, R_u','FontSize',14,'FontName',FN)
-    title(sprintf('R_u vs N (Semi-Log) | N_L = %.2f', N_L_used),'FontSize',14)
-    ylim([0 1.05]); grid on
-
-    subplot(2,1,2)
+    % ---- FIG 5: semi-log gamma_DA ----
+    figs(end+1) = newFigure('Fig05_SemiLog_GammaDA');
     semilogx(cycleNumbers(1:nC_liq), gamma_DA(1:nC_liq)*100, 's-', ...
              'Color', colors.green, 'LineWidth', 1.5, 'MarkerSize', 6, ...
              'MarkerFaceColor', colors.green); hold on
@@ -1156,10 +1114,9 @@ if config.output.figures
     xline(max(N_L_used, eps), 'r-', 'LineWidth', 2)
     xlabel('Number of Load Cycles, N_c (log scale)','FontSize',14,'FontName',FN)
     ylabel('\gamma_{DA} (%)','FontSize',14,'FontName',FN)
-    title(sprintf('\\gamma_{DA} vs N (Semi-Log) | N_L = %.2f', N_L_used),'FontSize',14)
+    title(sprintf('%s | CSR=%.3f | \\sigma''_{v0}=%.1f kPa | \\gamma_{DA} vs N | N_L = %.2f', ...
+          texSafe(testID), CSR_liq, sigma_v0_kPa, N_L_used),'FontSize',14)
     grid on
-    sgtitle(sprintf('%s | CSR=%.3f | \\sigma''_{v0}=%.1f kPa', ...
-            texSafe(testID), CSR_liq, sigma_v0_kPa),'FontSize',14,'FontWeight','bold')
 
     % ---- FIG 6: G/G1 and damping ----
     figs(end+1) = newFigure('Fig06_G_D_vs_Gamma');
@@ -1213,38 +1170,6 @@ if config.output.figures
             idx_data_liq, W_fraction_contribution, W_fraction_pct), ...
             'FontSize',14,'FontWeight','bold')
 
-    % ---- FIG 8: Ru vs Wn ----
-    figs(end+1) = newFigure('Fig08_Ru_vs_Wn');
-    subplot(2,2,[1,3])
-    plot(Wn_cumulative_trapz(1:nC_liq), Ru_atCycle(1:nC_liq), 'o-', ...
-         'Color', colors.blue, 'LineWidth', 2, 'MarkerSize', 8, ...
-         'MarkerFaceColor', colors.blue); hold on
-    yline(config.criteria.Ru, '--r', 'LineWidth', 1.5)
-    xline(Wn_at_liq_trapz, ':k', 'LineWidth', 1.5)
-    plot(Wn_at_liq_trapz, Ru_at_liq, 'rp', 'MarkerSize', 18, 'MarkerFaceColor', 'r')
-    xlabel('W_n (cumtrapz)','FontSize',16); ylabel('R_u','FontSize',16)
-    title('Pore Pressure vs Normalized Energy','FontSize',16); grid on
-    xmax = max(Wn_cumulative_trapz(1:nC_liq));
-    if isfinite(xmax) && xmax > 0, xlim([0 xmax*1.1]); end
-    ylim([0 1.05])
-
-    subplot(2,2,2)
-    plot(1:nC_liq, Ru_atCycle(1:nC_liq), 's-', 'Color', colors.orange, ...
-         'LineWidth', 1.5, 'MarkerSize', 5); hold on
-    yline(config.criteria.Ru, '--r'); xline(N_L_used, 'r-', 'LineWidth', 2)
-    xlabel('Cycle','FontSize',12); ylabel('R_u','FontSize',12)
-    title('R_u vs Cycle','FontSize',12); grid on; ylim([0 1.05])
-
-    subplot(2,2,4)
-    plot(1:nC_liq, Wn_cumulative_trapz(1:nC_liq), 'd-', 'Color', colors.green, ...
-         'LineWidth', 1.5, 'MarkerSize', 5); hold on
-    xline(N_L_used, 'r-', 'LineWidth', 2)
-    plot(N_L_used, Wn_at_liq_trapz, 'rp', 'MarkerSize', 12, 'MarkerFaceColor', 'r')
-    xlabel('Cycle','FontSize',12); ylabel('\SigmaW_n','FontSize',12)
-    title(sprintf('W_n @ N_L=%.2f: %.6f', N_L_used, Wn_at_liq_trapz),'FontSize',12); grid on
-    sgtitle(sprintf('CSR=%.3f | \\sigma''_{v0}=%.1f kPa | W_{liq}=%.1f J/m^3', ...
-            CSR_liq, sigma_v0_kPa, W_at_liq_trapz),'FontSize',14)
-
     % ---- FIG 9: Seed-Booker ----
     figs(end+1) = newFigure('Fig09_Ru_vs_NNL_SeedBooker');
     N_L_plot = max(N_L_used, eps);   % SA can return N_L = 0 at the very first point
@@ -1265,282 +1190,34 @@ if config.output.figures
     title(sprintf('Normalized Pore Pressure Generation | N_L = %.2f', N_L_used),'FontSize',14)
     xlim([0 1.05]); ylim([0 1.05]); grid on
 
-    % ---- FIG 10: continuous W vs Ru ----
-    figs(end+1) = newFigure('Fig10_Continuous_W_vs_Ru');
-    plot(W_running_norm(1:idx_data_roundup), Ru(1:idx_data_roundup), ...
-         'Color', colors.teal, 'LineWidth', 1.5); hold on
-    plot(W_running_norm(1:idx_data_roundup), Ru_envelope(1:idx_data_roundup), ...
-         '--', 'Color', colors.gray, 'LineWidth', 1.5)
-    yline(config.criteria.Ru, 'r--', 'LineWidth', 1.5)
-    plot(Wn_at_liq_trapz, Ru_at_liq, 'rp', 'MarkerSize', 18, 'MarkerFaceColor', 'r')
-    xlabel('Normalized Cumulative Energy, W_n','FontSize',16,'FontName',FN)
-    ylabel('Excess Pore Pressure Ratio, R_u','FontSize',16,'FontName',FN)
-    title(sprintf('Continuous Energy-Pore Pressure | W_n at liq = %.6f', Wn_at_liq_trapz),'FontSize',14)
-    legend('R_u','Envelope',sprintf('Threshold = %.2f', config.criteria.Ru), ...
-           'Liquefaction','Location','southeast')
-    ylim([0 1.05]); grid on
-
-    % ---- FIG 11: backbone ----
-    figs(end+1) = newFigure('Fig11_BackboneCurve');
-    hold on
-    for c = 1:nC_liq
-        cd_ = AC_complete{c};
-        plot(cd_(:,8), cd_(:,6), 'Color', [0.85 0.85 0.85], 'LineWidth', 0.5)
-    end
-    plot(backbone_gamma_pos(1:nC_liq)*100, backbone_tau_pos(1:nC_liq), 'o-', ...
-         'Color', colors.blue, 'LineWidth', 2, 'MarkerSize', 7, 'MarkerFaceColor', colors.blue)
-    plot(backbone_gamma_neg(1:nC_liq)*100, backbone_tau_neg(1:nC_liq), 's-', ...
-         'Color', colors.red, 'LineWidth', 2, 'MarkerSize', 7, 'MarkerFaceColor', colors.red)
-    xline(0, ':k'); yline(0, ':k')
-    xlabel('\gamma (%)','FontSize',16,'FontName',FN)
-    ylabel('\tau (kPa)','FontSize',16,'FontName',FN)
-    title(sprintf('Backbone Curve (Apex Points) | %d Cycles to N_L', nC_liq),'FontSize',14)
-    legend('Hysteresis Loops','Positive Backbone','Negative Backbone','Location','northwest')
-    grid on; hold off
-
-    % ---- FIG 12: CSR consistency ----
-    figs(end+1) = newFigure('Fig12_CSR_Consistency');
-    plot(cycleNumbers, CSR_per_cycle, 'o-', 'Color', colors.blue, ...
-         'LineWidth', 1.5, 'MarkerSize', 6, 'MarkerFaceColor', colors.blue); hold on
-    yline(CSR_liq, 'r--', 'LineWidth', 2)
-    yline(CSR_liq*1.05, ':k', 'LineWidth', 1)
-    yline(CSR_liq*0.95, ':k', 'LineWidth', 1)
-    xline(N_L_used, 'r-', 'LineWidth', 2)
-    xlabel('Cycle Number','FontSize',14,'FontName',FN)
-    ylabel('CSR per Cycle','FontSize',14,'FontName',FN)
-    title(sprintf('Loading Consistency QA | CSR = %.3f (\\pm5%% band)', CSR_liq),'FontSize',14)
-    grid on
-
-    % ---- FIG 13: criteria comparison ----
-    figs(end+1) = newFigure('Fig13_Criteria');
+    % ---- FIG 14: dynamic properties ----
+    figs(end+1) = newFigure('Fig14_DynamicProps');
     subplot(2,2,1)
-    plot(FCN, gamma_pct, 'Color', colors.blue, 'LineWidth', 1); hold on
-    yline(config.criteria.gamma_SA*100, '--r', 'LineWidth', 1.5)
-    yline(-config.criteria.gamma_SA*100, '--r', 'LineWidth', 1.5)
-    if LiqCriteria.SA.triggered, xline(LiqCriteria.SA.N_L, ':k', 'LineWidth', 1.5); end
-    if useExpert, xline(LiqCriteria.Expert.N_L, 'r-', 'LineWidth', 2); end
-    xlabel('Cycles','FontSize',11); ylabel('\gamma (%)','FontSize',11)
-    title(sprintf('SA: N_L = %.2f', LiqCriteria.SA.N_L),'FontSize',11); grid on
+    plot(cycleNumbers, G_sec_MPa, 'o-', 'Color', colors.blue, ...
+         'LineWidth', 1.5, 'MarkerSize', 5)
+    xlabel('Cycle','FontSize',12); ylabel('G_{sec} (MPa)','FontSize',12)
+    title('Secant Modulus (ASTM D8296-19)','FontSize',12); grid on
 
     subplot(2,2,2)
-    plot(cycleNumbers, gamma_DA*100, 'o-', 'Color', colors.green, ...
-         'LineWidth', 1.2, 'MarkerSize', 4); hold on
-    yline(config.criteria.gamma_DA*100, '--r', 'LineWidth', 1.5)
-    xline(LiqCriteria.DA.N_L, ':k', 'LineWidth', 1.5)
-    if useExpert, xline(LiqCriteria.Expert.N_L, 'r-', 'LineWidth', 2); end
-    xlabel('Cycles','FontSize',11); ylabel('\gamma_{DA} (%)','FontSize',11)
-    title(sprintf('DA: N_L = %.2f', LiqCriteria.DA.N_L),'FontSize',11); grid on
+    plot(cycleNumbers, G_ratio, 'o-', 'Color', colors.orange, ...
+         'LineWidth', 1.5, 'MarkerSize', 5); hold on
+    yline(config.criteria.G_ratio, '--r', 'LineWidth', 1.5)
+    xlabel('Cycle','FontSize',12); ylabel('G/G_1','FontSize',12)
+    title('Stiffness Degradation','FontSize',12); grid on
 
     subplot(2,2,3)
-    plot(FCN, Ru_envelope, 'Color', colors.orange, 'LineWidth', 1); hold on
-    yline(config.criteria.Ru, '--r', 'LineWidth', 1.5)
-    if LiqCriteria.Ru.triggered, xline(LiqCriteria.Ru.N_L, ':k', 'LineWidth', 1.5); end
-    if useExpert
-        xline(LiqCriteria.Expert.N_L, 'r-', 'LineWidth', 2)
-        plot(LiqCriteria.Expert.N_L, LiqCriteria.Expert.Ru_selected, 'rp', ...
-             'MarkerSize', 15, 'MarkerFaceColor', 'r')
-    end
-    xlabel('Cycles','FontSize',11); ylabel('R_u','FontSize',11)
-    title(sprintf('Ru: N_L = %.2f', LiqCriteria.Ru.N_L),'FontSize',11)
-    grid on; ylim([0 1.05])
+    plot(gamma_cyc*100, G_sec_MPa, 'o-', 'Color', colors.purple, ...
+         'LineWidth', 1.5, 'MarkerSize', 5)
+    xlabel('\gamma_{cyc} (%)','FontSize',12); ylabel('G_{sec} (MPa)','FontSize',12)
+    title('Modulus Reduction','FontSize',12); grid on
 
     subplot(2,2,4)
-    plot(cycleNumbers, G_ratio, 'o-', 'Color', colors.purple, ...
-         'LineWidth', 1.2, 'MarkerSize', 4); hold on
-    yline(config.criteria.G_ratio, '--r', 'LineWidth', 1.5)
-    if LiqCriteria.Stiff.triggered, xline(LiqCriteria.Stiff.N_L, ':k', 'LineWidth', 1.5); end
-    if useExpert, xline(LiqCriteria.Expert.N_L, 'r-', 'LineWidth', 2); end
-    xlabel('Cycles','FontSize',11); ylabel('G/G_1','FontSize',11)
-    title(sprintf('Stiff: N_L = %.2f', LiqCriteria.Stiff.N_L),'FontSize',11); grid on
-    sgtitle('Liquefaction Criteria Comparison','FontSize',14,'FontWeight','bold')
-
-    % ================== DIAGNOSTIC-ONLY FIGURES ==================
-    if ~isPaper
-
-        % ---- FIG 14: dynamic properties ----
-        figs(end+1) = newFigure('Fig14_DynamicProps');
-        subplot(2,2,1)
-        plot(cycleNumbers, G_sec_MPa, 'o-', 'Color', colors.blue, ...
-             'LineWidth', 1.5, 'MarkerSize', 5)
-        xlabel('Cycle','FontSize',12); ylabel('G_{sec} (MPa)','FontSize',12)
-        title('Secant Modulus (ASTM D8296-19)','FontSize',12); grid on
-
-        subplot(2,2,2)
-        plot(cycleNumbers, G_ratio, 'o-', 'Color', colors.orange, ...
-             'LineWidth', 1.5, 'MarkerSize', 5); hold on
-        yline(config.criteria.G_ratio, '--r', 'LineWidth', 1.5)
-        xlabel('Cycle','FontSize',12); ylabel('G/G_1','FontSize',12)
-        title('Stiffness Degradation','FontSize',12); grid on
-
-        subplot(2,2,3)
-        plot(gamma_cyc*100, G_sec_MPa, 'o-', 'Color', colors.purple, ...
-             'LineWidth', 1.5, 'MarkerSize', 5)
-        xlabel('\gamma_{cyc} (%)','FontSize',12); ylabel('G_{sec} (MPa)','FontSize',12)
-        title('Modulus Reduction','FontSize',12); grid on
-
-        subplot(2,2,4)
-        plot(gamma_cyc*100, D_ratio, 'o-', 'Color', colors.red, ...
-             'LineWidth', 1.5, 'MarkerSize', 5)
-        xlabel('\gamma_{cyc} (%)','FontSize',12); ylabel('D (%)','FontSize',12)
-        title('Damping Ratio vs Strain','FontSize',12); grid on
-        sgtitle(sprintf('Dynamic Properties | G_1 = %.2f MPa', R.G_sec1_MPa), ...
-                'FontSize',14,'FontWeight','bold')
-
-        % ---- FIG 15: cumtrapz energy detail ----
-        figs(end+1) = newFigure('Fig15_Cumtrapz_Energy');
-        subplot(2,3,1)
-        plot(FCN, W_running/1000, 'Color', colors.blue, 'LineWidth', 1.5); hold on
-        xline(N_L_used, 'r--', 'LineWidth', 2)
-        xlabel('Cycles','FontSize',12); ylabel('W (kJ/m^3)','FontSize',12)
-        title('Running Energy','FontSize',12); grid on
-
-        subplot(2,3,2)
-        plot(cycleNumbers, W_cycle, 'o-', 'Color', colors.blue, ...
-             'LineWidth', 1.5, 'MarkerSize', 5); hold on
-        plot(cycleNumbers, W_cycle_trapz, 's--', 'Color', colors.orange, ...
-             'LineWidth', 1.5, 'MarkerSize', 5)
-        xlabel('Cycle','FontSize',12); ylabel('W per cycle (J/m^3)','FontSize',12)
-        title(sprintf('polyarea vs cumtrapz (%.2f%%)', mean_diff_pct),'FontSize',12)
-        legend('polyarea','cumtrapz','Location','northwest'); grid on
-
-        subplot(2,3,3)
-        bar(1:nC_liq, [W_pos_cycle(1:nC_liq), abs(W_neg_cycle(1:nC_liq))], 'grouped')
-        xlabel('Cycle','FontSize',12); ylabel('Work (J/m^3)','FontSize',12)
-        title('W_{pos} vs |W_{neg}|','FontSize',12)
-        legend('W_{pos}','|W_{neg}|','Location','northwest'); grid on
-
-        subplot(2,3,4)
-        plot(cycleNumbers(1:nC_liq), W_pos_cumulative(1:nC_liq)/1000, 'o-', ...
-             'Color', colors.green, 'LineWidth', 1.5, 'MarkerSize', 5); hold on
-        plot(cycleNumbers(1:nC_liq), abs(W_neg_cumulative(1:nC_liq))/1000, 's-', ...
-             'Color', colors.red, 'LineWidth', 1.5, 'MarkerSize', 5)
-        plot(cycleNumbers(1:nC_liq), W_cumulative(1:nC_liq)/1000, 'd-', ...
-             'Color', colors.blue, 'LineWidth', 1.5, 'MarkerSize', 5)
-        xline(N_L_used, 'k--', 'LineWidth', 1.5)
-        xlabel('Cycle','FontSize',12); ylabel('\SigmaW (kJ/m^3)','FontSize',12)
-        title('Cumulative Work Components','FontSize',12)
-        legend('\SigmaW_{pos}','\Sigma|W_{neg}|','\SigmaW_{net}','Location','northwest')
-        grid on
-
-        subplot(2,3,5)
-        plot(cycleNumbers(1:nC_liq), Energy_recovery_ratio(1:nC_liq), 'o-', ...
-             'Color', colors.purple, 'LineWidth', 1.5, 'MarkerSize', 6, ...
-             'MarkerFaceColor', colors.purple); hold on
-        yline(1.0, 'g--', 'LineWidth', 1.5); yline(0.5, 'r:', 'LineWidth', 1.5)
-        xline(N_L_used, 'k--', 'LineWidth', 1.5)
-        xlabel('Cycle','FontSize',12); ylabel('|W_{neg}|/W_{pos}','FontSize',12)
-        title('Energy Recovery Ratio','FontSize',12)
-        yTop = max([1.1; Energy_recovery_ratio(1:nC_liq)*1.1], [], 'omitnan');
-        if isfinite(yTop) && yTop > 0, ylim([0 yTop]); end
-        grid on
-
-        subplot(2,3,6)
-        cycles_to_plot = unique([1, max(1,round(nC_liq/2)), max(1,nC_liq-1), nC_liq]);
-        cycles_to_plot = cycles_to_plot(cycles_to_plot <= nCompleteCycles);
-        cyc_cols = lines(numel(cycles_to_plot));
-        hold on
-        for ii = 1:numel(cycles_to_plot)
-            c = cycles_to_plot(ii);
-            gg = gamma_within_cycles{c};
-            gN = (gg - min(gg)) / (max(gg) - min(gg) + eps);
-            wN = W_within_cycles{c} / (max(abs(W_within_cycles{c})) + eps);
-            plot(gN, wN, '-', 'Color', cyc_cols(ii,:), 'LineWidth', 1.5)
-        end
-        xlabel('Normalized Position','FontSize',12); ylabel('Normalized Energy','FontSize',12)
-        title('Within-Cycle Energy Paths','FontSize',12); grid on; hold off
-        sgtitle(sprintf('Cumtrapz Energy Detail | %s | CSR=%.3f', ...
-                texSafe(testID), CSR_liq),'FontSize',14,'FontWeight','bold')
-
-        % ---- FIG 16: energy accumulation detail ----
-        figs(end+1) = newFigure('Fig16_EnergyDetail');
-        subplot(2,2,[1,3])
-        plot(FCN, W_running/1000, 'Color', colors.blue, 'LineWidth', 1.5); hold on
-        for c = 1:min(nC_liq, 20)
-            plot(FCN(cycleEndIdx(c)), W_running(cycleEndIdx(c))/1000, 'ko', ...
-                 'MarkerSize', 6, 'MarkerFaceColor', 'k')
-        end
-        plot(actual_liq_cycle, W_at_liq_polyarea/1000, 'gs', 'MarkerSize', 12, ...
-             'MarkerFaceColor', 'g', 'LineWidth', 2)
-        xline(N_L_used, 'r-', 'LineWidth', 2.5)
-        plot(N_L_used, W_at_liq_trapz/1000, 'rp', 'MarkerSize', 20, 'MarkerFaceColor', 'r')
-        xlabel('Cycles','FontSize',14); ylabel('W (kJ/m^3)','FontSize',14)
-        title(sprintf('cumtrapz = %.2f J/m^3 | polyarea = %.2f J/m^3', ...
-              W_at_liq_trapz, W_at_liq_polyarea),'FontSize',14); grid on
-
-        subplot(2,2,2)
-        dFCN = diff(FCN); dFCN(dFCN == 0) = eps;
-        plot((FCN(1:end-1)+FCN(2:end))/2, (diff(W_running)./dFCN)/1000, ...
-             'Color', colors.orange, 'LineWidth', 1); hold on
-        xline(N_L_used, 'r--', 'LineWidth', 1.5)
-        xlabel('Cycles','FontSize',12); ylabel('dW/dN (kJ/m^3/cycle)','FontSize',12)
-        title('Energy Dissipation Rate','FontSize',12); grid on
-
-        subplot(2,2,4)
-        plot(W_running_norm, Ru, 'Color', colors.teal, 'LineWidth', 1); hold on
-        plot(W_running_norm, Ru_envelope, '--', 'Color', colors.gray, 'LineWidth', 1.5)
-        yline(config.criteria.Ru, 'r--', 'LineWidth', 1.5)
-        plot(Wn_at_liq_trapz, Ru_at_liq, 'rp', 'MarkerSize', 15, 'MarkerFaceColor', 'r')
-        xlabel('W_n','FontSize',12); ylabel('R_u','FontSize',12)
-        title(sprintf('R_u vs W_n | W_n at liq = %.6f', Wn_at_liq_trapz),'FontSize',12)
-        ylim([0 1.05]); grid on
-        sgtitle(sprintf('ENERGY DETAIL | W_{liq}=%.2f J/m^3 | partial %.1f J/m^3 (%.1f%%)', ...
-                W_at_liq_trapz, W_fraction_contribution, W_fraction_pct), ...
-                'FontSize',14,'FontWeight','bold')
-
-        % ---- FIG 17: rates and QA ----
-        figs(end+1) = newFigure('Fig17_Rates');
-        subplot(2,2,1)
-        plot(cycleNumbers(1:nC_liq), dRu_dN(1:nC_liq), 'o-', 'Color', colors.blue, ...
-             'LineWidth', 1.5, 'MarkerSize', 5); hold on
-        xline(N_L_used, 'r-', 'LineWidth', 2)
-        xlabel('Cycle','FontSize',12); ylabel('\DeltaR_u / \DeltaN','FontSize',12)
-        title('Pore Pressure Generation Rate','FontSize',12); grid on
-
-        subplot(2,2,2)
-        plot(cycleNumbers(1:nC_liq), dGammaDA_dN(1:nC_liq)*100, 's-', ...
-             'Color', colors.green, 'LineWidth', 1.5, 'MarkerSize', 5); hold on
-        xline(N_L_used, 'r-', 'LineWidth', 2)
-        xlabel('Cycle','FontSize',12); ylabel('\Delta\gamma_{DA} / \DeltaN (%)','FontSize',12)
-        title('Strain Accumulation Rate','FontSize',12); grid on
-
-        subplot(2,2,3)
-        plot(cycleNumbers(1:nC_liq), cum_abs_gamma_cycle_total(1:nC_liq)*100, 'o-', ...
-             'Color', colors.purple, 'LineWidth', 1.5, 'MarkerSize', 5); hold on
-        xline(N_L_used, 'r-', 'LineWidth', 2)
-        xlabel('Cycle','FontSize',12); ylabel('\Sigma|\Delta\gamma| (%)','FontSize',12)
-        title(sprintf('Cumulative |\\Delta\\gamma| = %.4f%% at liq', ...
-              cum_abs_gamma_at_liq_pct),'FontSize',12); grid on
-
-        subplot(2,2,4)
-        plot(cycleNumbers, epsilon_v_pct(cycleEndIdx), 'o-', 'Color', colors.teal, ...
-             'LineWidth', 1.5, 'MarkerSize', 5); hold on
-        xline(N_L_used, 'r-', 'LineWidth', 2); yline(0, ':k')
-        xlabel('Cycle','FontSize',12); ylabel('\epsilon_v (%)','FontSize',12)
-        title('Vertical Strain (QA Check)','FontSize',12); grid on
-        sgtitle(sprintf('Rate Parameters & QA | %s', texSafe(testID)), ...
-                'FontSize',14,'FontWeight','bold')
-
-        % ---- FIG 18: damping evolution ----
-        figs(end+1) = newFigure('Fig18_Damping_Evolution');
-        subplot(1,2,1)
-        plot(Ru_atCycle(1:nC_liq), D_ratio(1:nC_liq), 'o-', 'Color', colors.purple, ...
-             'LineWidth', 1.5, 'MarkerSize', 7, 'MarkerFaceColor', colors.purple); hold on
-        xline(Ru_at_liq, 'r--', 'LineWidth', 1.5)
-        xlabel('R_u','FontSize',14,'FontName',FN)
-        ylabel('Damping Ratio, D (%)','FontSize',14,'FontName',FN)
-        title('Damping vs Pore Pressure','FontSize',14); grid on
-
-        subplot(1,2,2)
-        plot(Wn_cumulative_trapz(1:nC_liq), D_ratio(1:nC_liq), 's-', ...
-             'Color', colors.orange, 'LineWidth', 1.5, 'MarkerSize', 7, ...
-             'MarkerFaceColor', colors.orange); hold on
-        xline(Wn_at_liq_trapz, 'r--', 'LineWidth', 1.5)
-        xlabel('Cumulative W_n','FontSize',14,'FontName',FN)
-        ylabel('Damping Ratio, D (%)','FontSize',14,'FontName',FN)
-        title('Damping vs Cumulative Energy','FontSize',14); grid on
-        sgtitle(sprintf('Damping Evolution | %s | CSR=%.3f', texSafe(testID), CSR_liq), ...
-                'FontSize',14,'FontWeight','bold')
-    end
+    plot(gamma_cyc*100, D_ratio, 'o-', 'Color', colors.red, ...
+         'LineWidth', 1.5, 'MarkerSize', 5)
+    xlabel('\gamma_{cyc} (%)','FontSize',12); ylabel('D (%)','FontSize',12)
+    title('Damping Ratio vs Strain','FontSize',12); grid on
+    sgtitle(sprintf('Dynamic Properties | G_1 = %.2f MPa', R.G_sec1_MPa), ...
+            'FontSize',14,'FontWeight','bold')
 
     % ---- FIG 19: residual excess pore pressure ratio ----
     % Ru_res is read once per cycle (end-of-cycle value), as opposed to the
@@ -1583,8 +1260,7 @@ if config.output.figures
             texSafe(testID), Ru_res_at_liq),'FontSize',14,'FontWeight','bold')
 
     % ---- export and close ----
-    pdfName = fullfile(outputDir, sprintf('%s_CSR%.2f_%s_NL%.2f_Figures.pdf', ...
-                       testID, CSR_liq, config.criteria.primary, N_L_used));
+    pdfName = fullfile(outputDir, [outBase '.pdf']);
     if isfile(pdfName), delete(pdfName); end
     for f = 1:numel(figs)
         if isvalid(figs(f))
@@ -2152,7 +1828,6 @@ config.qa.CSR_refCycles      = 3;
 % ---------------------------------------------------------------- output --
 config.output.excel           = true;
 config.output.figures         = true;
-config.output.figureMode      = 'diagnostic';   % 'paper' | 'diagnostic'
 config.output.perCycleSheets  = false;  % one sheet per cycle: slow in batch
 config.output.subFolder       = 'results';
 config.output.masterFile      = 'liq_results_master.xlsx';
@@ -2169,8 +1844,6 @@ mustBeMemberLocal(config.criteria.onNotTriggered, {'nan','lastPoint'}, ...
                   'criteria.onNotTriggered');
 mustBeMemberLocal(config.expert.mode, {'stored','interactive','auto','off'}, ...
                   'expert.mode');
-mustBeMemberLocal(config.output.figureMode, {'paper','diagnostic'}, ...
-                  'output.figureMode');
 
 if strcmpi(config.criteria.primary, 'EXPERT') && strcmpi(config.expert.mode, 'off')
     error('liq:config:expertOff', ...
@@ -2697,7 +2370,7 @@ fig = uifigure('Name', 'Liquefaction Batch Analysis - Run Options', ...
 fig.CloseRequestFcn = @(src,~) onCancelOpts(src);
 
 gl = uigridlayout(fig, [6 1]);
-gl.RowHeight   = {24, 190, 190, 155, '1x', 38};
+gl.RowHeight   = {24, 190, 190, 115, '1x', 38};
 gl.ColumnWidth = {'1x'};
 gl.RowSpacing  = 12;
 
@@ -2781,8 +2454,8 @@ efG.Layout.Row = 4; efG.Layout.Column = 2;
 
 pOut = uipanel(gl, 'Title', 'Output');
 pOut.Layout.Row = 4;
-gOut = uigridlayout(pOut, [3 2]);
-gOut.RowHeight   = {28, 28, 28};
+gOut = uigridlayout(pOut, [2 2]);
+gOut.RowHeight   = {28, 28};
 gOut.ColumnWidth = {190, '1x'};
 gOut.RowSpacing  = 8;
 gOut.Padding     = [10 8 10 8];
@@ -2792,16 +2465,8 @@ chkExcel = uicheckbox(gOut, 'Text', 'Export results to Excel', ...
 chkExcel.Layout.Row = 1; chkExcel.Layout.Column = [1 2];
 
 chkFigs = uicheckbox(gOut, 'Text', 'Export figures to PDF', ...
-                     'Value', config.output.figures, ...
-                     'ValueChangedFcn', @(~,~) syncEnable());
+                     'Value', config.output.figures);
 chkFigs.Layout.Row = 2; chkFigs.Layout.Column = [1 2];
-
-lblFM = uilabel(gOut, 'Text', 'Figure mode:');
-lblFM.Layout.Row = 3; lblFM.Layout.Column = 1;
-ddFigMode = uidropdown(gOut, ...
-    'Items', {'Diagnostic - all figures', 'Paper-ready - publication subset'}, ...
-    'ItemsData', {'diagnostic','paper'}, 'Value', lower(config.output.figureMode));
-ddFigMode.Layout.Row = 3; ddFigMode.Layout.Column = 2;
 
 noteLbl = uilabel(gl, 'Text', '', 'WordWrap', 'on', ...
                   'VerticalAlignment', 'top', 'FontColor', [0.35 0.35 0.35]);
@@ -2830,8 +2495,6 @@ uiwait(fig);
         useExpert = chkExpert.Value;
         ddPick.Enable    = onOffSwitch(useExpert);
         lblPick.Enable   = onOffSwitch(useExpert);
-        ddFigMode.Enable = onOffSwitch(chkFigs.Value);
-        lblFM.Enable     = onOffSwitch(chkFigs.Value);
 
         if strcmpi(ddCrit.Value, 'EXPERT') && ~useExpert
             noteLbl.Text = ['Primary criterion is EXPERT but expert judgment is ' ...
@@ -2871,7 +2534,6 @@ uiwait(fig);
         config.criteria.G_ratio        = efG.Value;
         config.output.excel            = chkExcel.Value;
         config.output.figures          = chkFigs.Value;
-        config.output.figureMode       = ddFigMode.Value;
 
         okRun = true;
         delete(fig);
