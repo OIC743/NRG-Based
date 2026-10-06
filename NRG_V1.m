@@ -2663,4 +2663,4 @@ function mustBeMemberLocal(val, allowed, name)
 if ~(ischar(val) || isstring(val)) || ~any(strcmpi(char(val), allowed))
     error('liq:config:member', '%s must be one of: %s', name, strjoin(allowed, ', '));
 end
-end
+end
