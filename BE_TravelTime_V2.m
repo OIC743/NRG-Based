@@ -1,0 +1,1274 @@
+%% =========================================================================
+%  BENDER-ELEMENT SHEAR-WAVE TRAVEL-TIME ANALYSIS  (ASTM D8295-19)
+%  BE_TravelTime_V2  |  script version
+%  =========================================================================
+%
+%  HOW TO RUN: edit the USER SETTINGS block below and run the script (F5,
+%  or type BE_TravelTime_V2). Leave txFile / rxFile empty to be asked for
+%  each file in turn: first the TRANSMITTER, then the RECEIVER. Results are
+%  left in the workspace as the struct R (R.table lists the travel times).
+%
+%  INPUT FILES: oscilloscope CSV exports with a key/value header followed by
+%  a "Waveform Data" block (e.g. GW Instek GDS "Fast" mode: one integer ADC
+%  count per line; "Detail" mode time,value pairs are also accepted).
+%  Both files must come from the SAME acquisition (same trigger, same time
+%  base), e.g. CH1 = transmitter, CH2 = receiver.
+%
+%  TRAVEL-TIME METHODS (times are measured from the transmitter):
+%     1  Start to Start            ASTM D8295-19 §10.1.2
+%     2  Peak to Peak              ASTM D8295-19 §10.1.1
+%     3  Trough to Trough          consistency check on the 2nd lobe (not in D8295)
+%     4  Cross-correlation         time domain, raw signal shape (D8295 §10.2: "other method")
+%     5  Envelope cross-correl.    Hilbert envelopes                (D8295 §10.2)
+%     6  Cross-power spectrum      phase slope / group delay        (D8295 §10.2)
+%     7  First deflection          near-field onset, informational (lower bound)
+%     8  Manual pick (optional)    opts.manualPick = true
+%  D8295 §10.2 allows methods other than 1-2 only "provided they have been
+%  shown to provide reliable results"; report which method you used (§12.3.11).
+%
+%  START TO START: transmitter start = straight line through the 5-30 % part
+%  of its first rising flank, extrapolated to the baseline; receiver arrival
+%  = baseline crossing of the filtered trace that opens the first peak lobe.
+%  The zero-phase filter can move a SHARP receiver onset slightly earlier
+%  (about 1.5 % of the transmitter period in tests on synthetic records);
+%  compare with opts.filterType = 'none' when the onset looks abrupt.
+%
+%  CROSSTALK: electrical pick-up of the transmitter on the receiver (signal
+%  in the receiver while the transmitter is still active, shaped like the
+%  transmitter) is detected and reported. Picks that fall inside it are
+%  marked [CHECK]; set opts.minTravelTime to skip it.
+%
+%  Shear-wave velocity / Gmax (D8295 Eq. 1-3) are computed only if you
+%  supply the geometry (opts.H_i, opts.dH_c, opts.H_b, or opts.L directly),
+%  the time-delay correction opts.Tc (§8.1) and the density opts.rho.
+%
+%  Requires base MATLAB only (R2016b or later for local functions in a
+%  script; written for R2025b). opts.filterType = 'butter' needs the Signal
+%  Processing Toolbox.
+%  =========================================================================
+
+%% ============================ USER SETTINGS ==============================
+txFile = '';                    % transmitter CSV  ('' -> file dialog)
+rxFile = '';                    % receiver CSV     ('' -> file dialog)
+
+opts = struct();
+% --- receiver signal processing
+opts.rxPolarity       = +1;     % -1 inverts the receiver trace (D8295 §7.4.1)
+opts.filterType       = 'fft';  % 'fft' (zero-phase, no toolbox) | 'butter' (filtfilt) | 'none'
+opts.filterBand       = [];     % [fLow fHigh] Hz; [] -> filterBandFactor * f_tx
+opts.filterBandFactor = [0.25 4];
+opts.butterOrder      = 4;      % for 'butter' (applied forward-backward => zero phase)
+% --- picking
+opts.minTravelTime    = 0;      % s; nothing earlier is picked (use it to skip crosstalk)
+opts.maxTravelTime    = [];     % s; [] -> to the end of the record
+opts.ampFrac          = 0.25;   % rx peak must reach this fraction of max |rx| in the window
+opts.noiseK           = 4;      % detection threshold, multiples of pre-trigger noise
+opts.minSNR           = 10;     % below this receiver peak SNR every result is marked [CHECK]
+opts.manualPick       = false;  % true -> click picks on a figure afterwards
+% --- geometry and material (leave [] to skip Vs and Gmax)
+opts.L                = [];     % m, travel length tip-to-tip (overrides H_i, dH_c, H_b)
+opts.H_i              = [];     % m, initial specimen height       (D8295 Eq. 1)
+opts.dH_c             = 0;      % m, height change at reading       (D8295 Eq. 1)
+opts.H_b              = [];     % m, total bender protrusion        (D8295 Eq. 1)
+opts.Tc               = 0;      % s, time-delay correction           (D8295 §8.1)
+opts.rho              = [];     % kg/m^3, total density at reading   (D8295 Eq. 2)
+% --- oscilloscope and output
+opts.countsPerDiv     = 25;     % ADC counts per vertical division ("Fast" CSV). UNVERIFIED for
+                                % your scope model - affects amplitudes only, never travel times.
+opts.saveOutputs      = true;
+opts.outputFolder     = '';     % '' -> folder "BE_results_<rx file name>" next to the rx file
+opts.showFigures      = true;
+%% =========================================================================
+
+opts = defaultOptions(opts);
+
+% ---- 1. File selection: each file chosen separately ---------------------
+filt = {'*.csv;*.CSV;*.txt', 'Oscilloscope export (*.csv, *.txt)'; '*.*', 'All files (*.*)'};
+if isempty(txFile)
+    [f, p] = uigetfile(filt, 'Select the TRANSMITTED signal file (e.g. *_1.CSV)');
+    if isequal(f, 0), disp('No transmitter file selected - analysis cancelled.'); return; end
+    txFile = fullfile(p, f);
+end
+if isempty(rxFile)
+    [f, p] = uigetfile(filt, 'Select the RECEIVED signal file (e.g. *_2.CSV)', [fileparts(txFile) filesep]);
+    if isequal(f, 0), disp('No receiver file selected - analysis cancelled.'); return; end
+    rxFile = fullfile(p, f);
+end
+if ~isfile(txFile), error('BE:file', 'Transmitter file not found: %s', txFile); end
+if ~isfile(rxFile), error('BE:file', 'Receiver file not found: %s', rxFile); end
+if strcmpi(txFile, rxFile)
+    error('BE:sameFile', 'Transmitter and receiver files are the same file.');
+end
+
+% ---- 2. Read both records -----------------------------------------------
+TX = readScopeCSV(txFile, opts);
+RX = readScopeCSV(rxFile, opts);
+checkCompatible(TX, RX);
+dt = TX.dt;  fs = 1/dt;
+N  = min(numel(TX.v), numel(RX.v));
+t  = (0:N-1).' * dt;                 % common time base, s
+x  = TX.v(1:N);                      % transmitter, V
+yr = RX.v(1:N);                      % receiver (raw), V
+
+% ---- 3. Transmitter: start, peaks, frequency -----------------------------
+T = analyseTransmitter(t, x);
+x = x - T.baseline;                  % baseline-free transmitter
+f0 = T.f.primary;
+
+% ---- 4. Receiver: offset removal and filtering ---------------------------
+iPre = t < T.tStart;                 % nothing can arrive before excitation
+if nnz(iPre) < 20
+    warning('BE:shortPretrigger', ['Fewer than 20 pre-trigger samples; receiver offset ' ...
+        'and noise estimates are unreliable. Record more pre-trigger signal (D8295 §9.5).']);
+    iPre(1:min(20, N)) = true;
+end
+yr = yr - mean(yr(iPre));
+[y, F] = filterReceiver(yr, fs, f0, opts);
+y  = opts.rxPolarity * y;            % D8295 §7.4.1: optional trace inversion
+yr = opts.rxPolarity * yr;
+% lightly smoothed raw trace (centred moving average over 5 % of a period) for
+% onset work: it keeps the noise down without the long reach of the band-pass
+F.nSmooth = max(1, round(0.05 * T.period / dt));
+ys = movingMean(yr, F.nSmooth);
+% noise levels. A short pre-trigger holds few independent samples of band-limited
+% noise, so its estimate can come out low: the filtered and smoothed values are
+% never taken below what white noise of the raw level would give. The smoothed
+% trace keeps the DC level, so the uncertainty of the offset removed above counts too
+F.noiseRaw    = robustStd(yr(iPre));
+F.noiseFilt   = max(robustStd(y(iPre)), F.noiseRaw * sqrt(mean(F.H.^2)));
+F.noiseSmooth = max(robustStd(ys(iPre)), F.noiseRaw * sqrt(1/F.nSmooth + 1/nnz(iPre)));
+
+% ---- 5. Crosstalk check and receiver picks -------------------------------
+X = crosstalkCheck(t, x, ys, T, F, opts);
+P = pickReceiver(t, y, yr, ys, T, F, opts);
+
+% ---- 6. Travel times by every method -------------------------------------
+% every method needs a receiver signal clearly above the noise (opts.minSNR)
+sigOK = P.snr >= opts.minSNR;
+if ~sigOK && ~isnan(P.snr)
+    warning('BE:weakSignal', ['Receiver peak SNR = %.1f is below opts.minSNR = %g: the signal may be ' ...
+        'noise. All travel times are marked [CHECK].'], P.snr, opts.minSNR);
+end
+M = struct('name', {}, 'tag', {}, 'basis', {}, 'Ts', {}, 'quality', {}, 'note', {});
+M(end+1) = mrow('Start to Start',     'S2S', 'ASTM D8295 §10.1.2', P.tArrival - T.tStart, P.ok && sigOK, ...
+               'rx baseline crossing before 1st peak minus tx start');
+M(end+1) = mrow('Peak to Peak',       'P2P', 'ASTM D8295 §10.1.1', P.tPeak1 - T.tPeak, P.ok && sigOK, ...
+               '1st rx peak minus 1st tx peak');
+M(end+1) = mrow('Trough to Trough',   'T2T', 'check (not in D8295)', P.tTrough1 - T.tTrough, ...
+               P.ok && sigOK && ~isnan(P.tTrough1), '1st rx trough after the 1st peak minus tx trough');
+C  = crossCorr(x, y, dt, T, opts, false);
+M(end+1) = mrow('Cross-correlation',  'CC', 'D8295 §10.2 (other)', C.lag, C.ok && sigOK, ...
+               sprintf('max normalised CC = %.3f', C.peak));
+CE = crossCorr(x, y, dt, T, opts, true);
+M(end+1) = mrow('Envelope cross-correlation', 'ECC', 'D8295 §10.2 (other)', CE.lag, CE.ok && sigOK, ...
+               sprintf('max normalised CC of envelopes = %.3f', CE.peak));
+S  = crossSpectrum(x, y, fs, f0, F);
+M(end+1) = mrow('Cross-power spectrum', 'CPS', 'D8295 §10.2 (other)', S.tau, S.ok && sigOK, ...
+               sprintf('phase-slope fit %.1f-%.1f kHz, R^2 = %.3f', S.band/1e3, S.R2));
+M(end+1) = mrow('First deflection',   'FD', 'informational (near-field onset)', ...
+               P.tFirstDev - T.tStart, ~isnan(P.tFirstDev) && sigOK, ...
+               sprintf('first sustained |rx| > %g x noise (smoothed raw trace); lower bound, includes near field', ...
+               opts.noiseK));
+if ~isempty(RX.counts) && RX.levels < 20                 % picks on a staircase trace
+    M = flagRows(M, ismember({M.tag}, {'S2S', 'P2P', 'T2T', 'FD'}), ...
+        sprintf('receiver uses only %d ADC levels', RX.levels));
+end
+
+% ---- 7. Raw-signal cross-correlation as a filter-sensitivity check -------
+Craw = crossCorr(x, yr, dt, T, opts, false);
+
+% ---- 8. Figures ----------------------------------------------------------
+figs = gobjects(0);
+info = figInfo(TX, RX, T, F, opts);
+figs(end+1) = plotOverview(t, x, yr, y, T, F, P, info, opts);
+figs(end+1) = plotS2S(t, x, yr, y, T, P, M(1), X, info);
+figs(end+1) = plotPeaks(t, x, yr, y, T, P, M(2), M(3), info);
+figs(end+1) = plotCC(t, x, y, C,  T, M(4), info, 'Cross-correlation of transmitter and receiver signals');
+figs(end+1) = plotCC(t, T.env, P.env, CE, T, M(5), info, 'Cross-correlation of signal envelopes');
+figs(end+1) = plotCPS(S, M(6), f0, info);
+
+% ---- 9. Optional manual pick (D8295 Fig. 3 style, user clicks) -----------
+if opts.manualPick
+    [tsMan, okMan] = manualPick(t, x, y, T, info);
+    M(end+1) = mrow('Manual pick', 'MAN', 'user pick', tsMan, okMan, 'clicked tx point then rx point');
+end
+
+% ---- 10. Window and crosstalk flags, velocity, Gmax, wavelength ratio ----
+tsAll = [M.Ts];
+tMaxTT = Inf;  if ~isempty(opts.maxTravelTime), tMaxTT = opts.maxTravelTime; end
+M = flagRows(M, tsAll < opts.minTravelTime | tsAll > tMaxTT, 'outside the search window');
+if X.detected
+    M = flagRows(M, tsAll < X.window(2) - T.tStart, 'inside the crosstalk window');
+end
+if T.extraCycles                                         % envelope of a continuing wave has no feature
+    M = flagRows(M, strcmp({M.tag}, 'ECC'), 'transmitter is not a single pulse');
+end
+M = addVelocity(M, opts, f0, P.fPeakTrough);
+figs(end+1) = plotSummary(M, Craw, info, opts);
+
+% ---- 11. Report ----------------------------------------------------------
+R = struct();
+R.files     = struct('tx', txFile, 'rx', rxFile);
+R.meta      = struct('tx', TX.meta, 'rx', RX.meta);
+R.dt        = dt;
+R.transmitter = T;
+R.filter    = rmfield(F, {'H', 'fAxis'});
+R.crosstalk = X;
+R.picks     = rmfield(P, 'env');
+R.cc        = C;  R.ccEnvelope = CE;  R.ccRaw = Craw;  R.crossSpectrum = S;
+R.methods   = M;
+R.table     = struct2table(rmfield(M, 'tag'));
+R.options   = opts;
+R.figures   = figs;
+printReport(R);
+if opts.saveOutputs
+    R.outputFolder = saveOutputs(R, figs, opts);
+end
+
+% =========================================================================
+%                              OPTIONS
+% =========================================================================
+function o = defaultOptions(o)
+d.countsPerDiv     = 25;
+d.rxPolarity       = +1;
+d.filterType       = 'fft';
+d.filterBand       = [];
+d.filterBandFactor = [0.25 4];
+d.butterOrder      = 4;
+d.minTravelTime    = 0;
+d.maxTravelTime    = [];
+d.ampFrac          = 0.25;
+d.noiseK           = 4;
+d.minSNR           = 10;
+d.manualPick       = false;
+d.L                = [];
+d.H_i              = [];
+d.dH_c             = 0;
+d.H_b              = [];
+d.Tc               = 0;
+d.rho              = [];
+d.saveOutputs      = true;
+d.outputFolder     = '';
+d.showFigures      = true;
+fn = fieldnames(d);
+unknown = setdiff(fieldnames(o), fn);
+if ~isempty(unknown)
+    warning('BE:opt', 'Unknown option(s) ignored (check the spelling): %s', strjoin(unknown(:).', ', '));
+end
+for k = 1:numel(fn)
+    if ~isfield(o, fn{k}) || (isempty(o.(fn{k})) && ~isempty(d.(fn{k})) && ~ischar(d.(fn{k})))
+        o.(fn{k}) = d.(fn{k});
+    end
+end
+o.filterType = lower(o.filterType);
+isPos = @(v) isnumeric(v) && isscalar(v) && isfinite(v) && v > 0;
+isBand = @(v) isnumeric(v) && numel(v) == 2 && all(isfinite(v)) && v(1) > 0 && v(2) > v(1);
+check(ismember(o.rxPolarity, [-1 1]), 'opts.rxPolarity must be +1 or -1.');
+check(ismember(o.filterType, {'fft', 'butter', 'none'}), 'opts.filterType must be ''fft'', ''butter'' or ''none''.');
+check(isempty(o.filterBand) || isBand(o.filterBand), 'opts.filterBand must be [] or [fLow fHigh] with 0 < fLow < fHigh.');
+check(isBand(o.filterBandFactor), 'opts.filterBandFactor must be [a b] with 0 < a < b.');
+check(isPos(o.butterOrder) && o.butterOrder == round(o.butterOrder), 'opts.butterOrder must be a positive integer.');
+check(isnumeric(o.minTravelTime) && isscalar(o.minTravelTime) && o.minTravelTime >= 0, ...
+    'opts.minTravelTime must be a scalar >= 0 (seconds).');
+check(isempty(o.maxTravelTime) || (isPos(o.maxTravelTime) && o.maxTravelTime > o.minTravelTime), ...
+    'opts.maxTravelTime must be [] or a time (s) larger than opts.minTravelTime.');
+check(isPos(o.ampFrac) && o.ampFrac < 1, 'opts.ampFrac must be between 0 and 1.');
+check(isPos(o.noiseK), 'opts.noiseK must be positive.');
+check(isPos(o.minSNR), 'opts.minSNR must be positive.');
+check(isPos(o.countsPerDiv), 'opts.countsPerDiv must be positive.');
+check(isnumeric(o.Tc) && isscalar(o.Tc) && isfinite(o.Tc), 'opts.Tc must be a finite scalar (seconds).');
+check(isnumeric(o.dH_c) && isscalar(o.dH_c) && isfinite(o.dH_c), 'opts.dH_c must be a finite scalar (m).');
+names = {'L', 'H_i', 'H_b', 'rho'};
+for k = 1:numel(names)
+    check(isempty(o.(names{k})) || isPos(o.(names{k})), sprintf('opts.%s must be [] or a positive scalar.', names{k}));
+end
+end
+
+function check(ok, msg)
+if ~ok, error('BE:opt', '%s', msg); end
+end
+
+% =========================================================================
+%                              FILE READING
+% =========================================================================
+function S = readScopeCSV(file, opts)
+txt = fileread(file);
+if startsWith(txt, char(65279)), txt = txt(2:end);                 % UTF-8 byte-order mark
+elseif startsWith(txt, char([239 187 191])), txt = txt(4:end);
+end
+[i0, i1] = regexp(txt, '^[ \t]*Waveform Data[^\r\n]*', 'start', 'end', 'once', 'lineanchors', 'ignorecase');
+if isempty(i0)
+    error('BE:format', 'No "Waveform Data" line found in %s.', file);
+end
+header = regexp(txt(1:i0-1), '\r\n|\n|\r', 'split');
+block  = txt(i1+1:end);
+meta = struct();
+for k = 1:numel(header)
+    parts = strsplit(header{k}, ',');
+    key = strtrim(parts{1});
+    if isempty(key), continue; end
+    val = '';
+    if numel(parts) >= 2, val = strtrim(parts{2}); end
+    num = str2double(val);
+    fld = matlab.lang.makeValidName(key);
+    if ~isnan(num), meta.(fld) = num; else, meta.(fld) = val; end
+end
+
+% data block: the fast path reads it in one call; irregular files line by line
+toSpaces = @(s) regexprep(s, '[,;]', ' ');
+probe = regexp(block(1:min(end, 4000)), '\r\n|\n|\r', 'split');
+if numel(block) > 4000, probe = probe(1:end-1); end    % last line may be cut
+probe = probe(~cellfun(@(s) isempty(strtrim(s)), probe));
+nc = cellfun(@(s) numel(sscanf(toSpaces(s), '%f')), probe);
+nCol = 0;  if any(nc > 0), nCol = mode(nc(nc > 0)); end
+if nCol > 2
+    error('BE:format', '%s has %d numeric columns; export one channel per file.', file, nCol);
+end
+data = [];
+if nCol >= 1
+    [v, ~, errmsg] = sscanf(toSpaces(block), '%f');
+    if isempty(errmsg) && mod(numel(v), nCol) == 0      % every token numeric, whole rows
+        data = reshape(v, nCol, []).';
+    end
+end
+if isempty(data)                                       % irregular lines: parse one by one
+    body = regexp(block, '\r\n|\n|\r', 'split');
+    data = NaN(numel(body), 2);  n = 0;
+    for k = 1:numel(body)
+        v = sscanf(toSpaces(body{k}), '%f');
+        if isempty(v), continue; end
+        n = n + 1;
+        data(n, 1:min(2, numel(v))) = v(1:min(2, numel(v))).';
+    end
+    data = data(1:n, :);
+    if mean(~isnan(data(:, 2))) > 0.95
+        data = data(~isnan(data(:, 2)), :);            % time,value rows only
+    else
+        data = data(:, 1);
+    end
+end
+n = size(data, 1);
+if n < 50, error('BE:format', 'Only %d data points read from %s.', n, file); end
+
+S.file = file;  S.meta = meta;
+[~, nm, ex] = fileparts(file);  S.name = [nm ex];
+if size(data, 2) == 2                                  % "Detail" export: time, value (V)
+    S.mode = 'time,value';
+    S.v    = data(:, 2);
+    S.counts = [];
+    tc = data(:, 1);
+    if any(diff(tc) < 0) || ~(tc(end) > tc(1))
+        error('BE:format', ['%s: the first of two columns is not a time axis (a two-channel ' ...
+            'export?). Export one channel per file.'], S.name);
+    end
+    % time stamps are often printed with few digits, so steps between rows can
+    % repeat or jump: take the step from the header, else from the whole span
+    S.dt = (tc(end) - tc(1)) / (n - 1);
+    if isfield(meta, 'SamplingPeriod') && isnumeric(meta.SamplingPeriod) && meta.SamplingPeriod > 0
+        if abs(meta.SamplingPeriod - S.dt) > 0.01 * S.dt
+            warning('BE:timebase', '%s: header Sampling Period %.4g s differs from the time column (%.4g s); the header is used.', ...
+                S.name, meta.SamplingPeriod, S.dt);
+        end
+        S.dt = meta.SamplingPeriod;
+    end
+    if max(abs(tc - tc(1) - (0:n-1).' * S.dt)) > 0.01 * (tc(end) - tc(1))
+        warning('BE:timebase', '%s: time column is not uniform; a constant step of %.4g s is used.', S.name, S.dt);
+    end
+else                                                   % "Fast" export: ADC counts
+    S.mode = 'ADC counts';
+    if ~isfield(meta, 'SamplingPeriod') || ~isnumeric(meta.SamplingPeriod) || ~(meta.SamplingPeriod > 0)
+        error('BE:format', 'No valid "Sampling Period" in the header of %s.', file);
+    end
+    S.dt = meta.SamplingPeriod;
+    S.counts = data(:, 1);
+    vs = 1;
+    if isfield(meta, 'VerticalScale') && isnumeric(meta.VerticalScale) && meta.VerticalScale > 0
+        vs = meta.VerticalScale;
+    else
+        warning('BE:noScale', 'No usable "Vertical Scale" in %s; amplitudes left in ADC counts.', S.name);
+    end
+    S.v = S.counts * vs / opts.countsPerDiv;
+    if isfield(meta, 'VerticalPosition') && isnumeric(meta.VerticalPosition) && meta.VerticalPosition ~= 0
+        warning('BE:vpos', ['%s: Vertical Position = %g is not applied. The DC offset is ' ...
+            'removed anyway, so travel times are unaffected.'], S.name, meta.VerticalPosition);
+    end
+end
+if any(~isfinite(S.v))
+    error('BE:format', '%s contains non-numeric samples in the waveform block.', S.name);
+end
+if isfield(meta, 'MemoryLength') && isnumeric(meta.MemoryLength) && meta.MemoryLength ~= numel(S.v)
+    warning('BE:length', '%s: header says %d points, %d read.', S.name, meta.MemoryLength, numel(S.v));
+end
+S.levels = numel(unique(S.v));
+if ~isempty(S.counts) && S.levels < 20
+    warning('BE:resolution', ['%s uses only %d distinct ADC levels: the trace is coarsely ' ...
+        'quantised. Increase the vertical gain on this channel (D8295 §9.6).'], S.name, S.levels);
+end
+end
+
+function checkCompatible(TX, RX)
+if abs(TX.dt - RX.dt) > 1e-6 * TX.dt
+    error('BE:timebase', 'Sampling periods differ (%g s vs %g s): not one acquisition.', TX.dt, RX.dt);
+end
+if numel(TX.v) ~= numel(RX.v)
+    warning('BE:length', 'Records have different lengths (%d vs %d); the shorter is used.', ...
+        numel(TX.v), numel(RX.v));
+end
+keys = {'HorizontalScale', 'HorizontalPosition', 'TriggerLevel'};
+for k = 1:numel(keys)
+    if isfield(TX.meta, keys{k}) && isfield(RX.meta, keys{k}) && ...
+            isnumeric(TX.meta.(keys{k})) && ~isequal(TX.meta.(keys{k}), RX.meta.(keys{k}))
+        warning('BE:timebase', '"%s" differs between files - are they from the same acquisition?', keys{k});
+    end
+end
+if isfield(TX.meta, 'Source') && isfield(RX.meta, 'Source') && ischar(TX.meta.Source) && ...
+        strcmp(TX.meta.Source, RX.meta.Source)
+    warning('BE:source', 'Both files come from channel %s. Check the file selection.', TX.meta.Source);
+end
+end
+
+% =========================================================================
+%                              TRANSMITTER
+% =========================================================================
+function T = analyseTransmitter(t, x)
+N   = numel(x);
+dt  = t(2) - t(1);
+x0  = x - median(x);
+A0  = max(abs(x0));
+if A0 == 0, error('BE:txShape', 'The transmitter record is flat.'); end
+iBig = find(abs(x0) > 0.2 * A0, 1);
+% baseline: walk back down the flank to 2 % of the amplitude, then step back
+% as far again as half the 2-20 % rise time, so no flank samples are included
+k2 = iBig;  while k2 > 1 && abs(x0(k2)) > 0.02 * A0, k2 = k2 - 1; end
+nb = k2 - max(5, ceil(0.5 * (iBig - k2)));
+if nb < 10 && k2 - 1 >= 10
+    nb = k2 - 1;                      % short pre-trigger: everything below the 2 % level
+    warning('BE:pretrigger', ['Short pre-trigger on the transmitter: its baseline includes the ' ...
+        'first part of the rise (below 2 %% of the amplitude). Record more pre-trigger signal.']);
+end
+if nb < 10
+    error('BE:pretrigger', ['The transmitter pulse starts at the very beginning of the record ' ...
+        '(fewer than 10 baseline samples). Record more pre-trigger signal.']);
+end
+T.baseline = median(x(1:nb));
+xb = x - T.baseline;
+T.noise = robustStd(xb(1:nb));
+s   = sign(xb(iBig));                 % polarity of the first transmitter lobe
+T.sign = s;
+z   = s * xb;                         % first lobe positive
+A   = max(z(iBig:min(N, iBig + round(N/4))));
+
+% --- lobe boundaries. The top of the first lobe is the maximum before the trace is
+%     clearly negative, so noise or quantisation steps on the flank cannot stop
+%     the search early; zero-valued samples are skipped
+iDeep = iBig + find(z(iBig+1:end) < -0.2 * A, 1);                       % well into the 2nd lobe
+if isempty(iDeep)
+    error('BE:txShape', 'The transmitter has no negative lobe: not a single-period sine pulse.');
+end
+[~, j] = max(z(iBig:iDeep));  iPk = iBig + j - 1;                       % top of first lobe
+seg  = find(z(1:iPk) <= 0, 1, 'last');  if isempty(seg), seg = 1; end   % last baseline sample
+iMid = iDeep;  while iMid > iPk && z(iMid) <= 0, iMid = iMid - 1; end   % last positive sample
+iNeg = iMid + find(z(iMid+1:end) < 0, 1);                               % first negative sample
+iEnd = iDeep + find(z(iDeep+1:end) >= -0.05 * A, 1);                    % back near the baseline
+if isempty(iEnd), iEnd = N; end
+[~, j] = min(z(iNeg:iEnd));  iTr = iNeg + j - 1;
+A2 = -z(iTr);
+
+% --- peak and trough (sub-sample)
+[T.tPeak, T.aPeak]     = refineExtremum(t, z, seg+1, iMid, +1);
+[T.tTrough, T.aTrough] = refineExtremum(t, z, iNeg, iEnd, -1);
+T.aPeak = s * T.aPeak;  T.aTrough = s * T.aTrough;
+
+% --- start, mid and end: straight line through the near-zero part of each flank,
+%     extrapolated to the baseline (insensitive to noise and to quantisation steps)
+T.tStart = flankRoot(t, z, seg:iPk,                  0.05*A,   0.30*A);
+T.tMid   = flankRoot(t, z, iPk:iTr,                 -0.30*A2,  0.30*A);
+T.tEnd   = flankRoot(t, z, iTr:min(N, iEnd + 1),    -0.30*A2, -0.05*A2);
+T.tStartCrossing = crossTime(t, z, seg);           % plain baseline crossing, for comparison
+if ~(T.tStart < T.tMid && T.tMid < T.tEnd)
+    error('BE:txShape', 'Transmitter start, mid and end crossings are out of order: not a sine pulse.');
+end
+
+% --- frequency estimates
+T.f.fullPeriod  = 1 / (T.tEnd - T.tStart);        % one complete sine period
+T.f.halfPeriod1 = 1 / (2 * (T.tMid - T.tStart));
+T.f.halfPeriod2 = 1 / (2 * (T.tEnd - T.tMid));
+T.f.peakTrough  = 1 / (2 * (T.tTrough - T.tPeak));
+nfft = fftLength(N, 16);
+X = abs(fft(xb, nfft));  fa = (0:nfft-1).' / nfft / dt;
+half = 2:floor(nfft/2);
+[~, im] = max(X(half));
+T.f.spectralPeak = fa(half(im));                  % NOT the nominal frequency for a 1-cycle burst
+T.f.primary = T.f.fullPeriod;
+T.f.method  = 'full period (start to end zero crossing)';
+T.period = 1 / T.f.primary;
+
+% --- single-period check (D8295 §6.4 asks for a single-period sine pulse)
+after = z(min(N, iEnd + 2):end);
+T.extraCycles = ~isempty(after) && max(abs(after)) > 0.2 * A;
+if T.extraCycles
+    warning('BE:txShape', ['The transmitter signal continues after the first period; ' ...
+        'frequency and picks use the first period only.']);
+end
+spread = std([T.f.fullPeriod T.f.halfPeriod1 T.f.halfPeriod2 T.f.peakTrough]) / T.f.primary;
+if spread > 0.05
+    warning('BE:txShape', 'Transmitter frequency estimates differ by %.0f %%: pulse is not a clean sine.', 100*spread);
+end
+T.x   = xb;
+T.env = envAnalytic(xb);
+end
+
+% =========================================================================
+%                              RECEIVER
+% =========================================================================
+function [y, F] = filterReceiver(yr, fs, f0, opts)
+F.type = opts.filterType;
+if isempty(opts.filterBand), F.band = opts.filterBandFactor * f0; else, F.band = opts.filterBand(:).'; end
+F.band(2) = min(F.band(2), 0.45 * fs);
+if F.band(1) >= F.band(2)
+    error('BE:opt', 'Filter band %.4g-%.4g Hz is empty after limiting it to 0.45 x sampling rate.', F.band);
+end
+N = numel(yr);
+nfft = 2^nextpow2(2 * N);
+F.fAxis = (0:nfft/2).' * fs / nfft;
+switch F.type
+    case 'none'
+        y = yr;  F.H = ones(size(F.fAxis));
+    case 'fft'
+        % zero-phase band-pass: flat pass band, raised-cosine roll-offs one octave wide
+        f = F.fAxis;  lo = F.band(1);  hi = F.band(2);
+        H = ones(size(f));
+        H(f <= lo/2) = 0;
+        m = f > lo/2 & f < lo;     H(m) = 0.5 - 0.5*cos(pi*(f(m) - lo/2)/(lo/2));
+        m = f > hi & f < 2*hi;     H(m) = 0.5 + 0.5*cos(pi*(f(m) - hi)/hi);
+        H(f >= 2*hi) = 0;
+        Hfull = [H; flipud(H(2:end-1))];
+        Y = fft([yr; zeros(nfft - N, 1)]);
+        yy = real(ifft(Y .* Hfull));
+        y = yy(1:N);  F.H = H;
+    case 'butter'
+        if ~(exist('butter', 'file') && exist('filtfilt', 'file') && exist('zp2sos', 'file'))
+            error('BE:toolbox', 'opts.filterType = ''butter'' needs the Signal Processing Toolbox.');
+        end
+        % second-order sections: the [b,a] form is numerically unreliable at the
+        % very low normalised cut-offs typical here (kHz signals, MHz sampling)
+        [zz, pp, kk] = butter(opts.butterOrder, F.band / (fs/2), 'bandpass');
+        [sos, g] = zp2sos(zz, pp, kk);
+        y = filtfilt(sos, g, yr);
+        zi = exp(-1i * 2*pi * F.fAxis / fs);           % z^-1 on the frequency axis
+        h = g * ones(size(zi));
+        for k = 1:size(sos, 1)
+            h = h .* (sos(k,1) + sos(k,2)*zi + sos(k,3)*zi.^2) ./ (sos(k,4) + sos(k,5)*zi + sos(k,6)*zi.^2);
+        end
+        F.H = abs(h).^2;                               % forward-backward magnitude
+end
+end
+
+function X = crosstalkCheck(t, x, ys, T, F, opts)
+% electrical pick-up: receiver activity while the transmitter is still active,
+% with the shape of the transmitter (or of its derivative, capacitive coupling)
+X.window = [T.tStart, T.tEnd + 0.1 * T.period];
+k = t >= X.window(1) & t <= X.window(2);
+X.amp = max(abs(ys(k)));
+X.corr = max(abs([ncorr(ys(k), x(k)), ncorr(ys(k), gradient(x(k)))]));
+X.detected = X.amp > opts.noiseK * F.noiseSmooth && X.corr > 0.7;
+X.minTravelTimeHint = X.window(2) - T.tStart;
+if X.detected && opts.minTravelTime < X.minTravelTimeHint
+    warning('BE:crosstalk', ['The receiver shows electrical crosstalk while the transmitter is active ' ...
+        '(%.3g mV, correlation %.2f with the transmitter). Picks inside it are marked [CHECK]. If the ' ...
+        'true arrival is later, set opts.minTravelTime = %.0fe-6 (s).'], 1e3*X.amp, X.corr, ...
+        ceil(1e6 * X.minTravelTimeHint));
+end
+end
+
+function P = pickReceiver(t, y, yRaw, ys, T, F, opts)
+N = numel(y);  dt = t(2) - t(1);  s = T.sign;
+z = s * y;  zs = s * ys;
+P.tPeak1 = NaN; P.aPeak1 = NaN; P.tArrival = NaN;
+P.tTrough1 = NaN; P.aTrough1 = NaN; P.fPeakTrough = NaN;
+P.tNearField = NaN; P.aNearField = NaN; P.tFilterDip = NaN; P.tFirstDev = NaN;
+P.ok = false;  P.snr = NaN;  P.fSpec = NaN;  P.env = envAnalytic(y);
+
+tMin = T.tStart + opts.minTravelTime;
+tMax = t(end);
+if ~isempty(opts.maxTravelTime), tMax = min(tMax, T.tStart + opts.maxTravelTime); end
+win = find(t >= tMin & t <= tMax);
+if numel(win) < 10
+    warning('BE:window', 'The search window (minTravelTime to maxTravelTime) holds fewer than 10 samples.');
+    return
+end
+thrNoise = opts.noiseK * F.noiseFilt;
+Amax = max(abs(z(win)));
+P.ok = Amax > thrNoise;
+P.snr = Amax / F.noiseFilt;
+if ~P.ok
+    warning('BE:noSignal', ['No receiver signal above %g x noise. See D8295 §9.13 ' ...
+        '(contact, stiffness, wiring).'], opts.noiseK);
+end
+thr = max(thrNoise, opts.ampFrac * Amax);
+
+% local extrema of the filtered receiver in the window
+d  = diff(z);
+iMx = find([false; d(1:end-1) > 0 & d(2:end) <= 0; false]);
+iMn = find([false; d(1:end-1) < 0 & d(2:end) >= 0; false]);
+iMx = iMx(iMx >= win(1) & iMx <= win(end) & z(iMx) >= thr);
+iMn = iMn(iMn >= win(1) & iMn <= win(end));
+
+if isempty(iMx)
+    P.ok = false;
+else
+    i1 = iMx(1);
+    % first-peak lobe; it ends where the trace goes clearly negative (beyond the
+    % noise band), so noise wiggles around zero do not cut it short
+    lo = i1;  while lo > 1 && z(lo-1) > 0, lo = lo - 1; end
+    hi = i1;  while hi < N && z(hi+1) > -thrNoise, hi = hi + 1; end
+    [P.tPeak1, a] = refineExtremum(t, z, lo, hi, +1);  P.aPeak1 = s * a;
+    % Start to Start: baseline (zero) crossing that opens this lobe (D8295 §10.1.2)
+    P.tArrival = crossTime(t, z, lo - 1);
+    % first trough after the first peak (opposite lobe, same noise band)
+    lo2 = hi + 1;  hi2 = lo2;  while hi2 < N && z(hi2+1) < thrNoise, hi2 = hi2 + 1; end
+    if lo2 < N && min(z(lo2:hi2)) < -thrNoise
+        [P.tTrough1, a2] = refineExtremum(t, z, lo2, hi2, -1);  P.aTrough1 = s * a2;
+        P.fPeakTrough = 1 / (2 * (P.tTrough1 - P.tPeak1));
+    end
+    % near-field excursion: largest opposite-sign extremum before the first lobe.
+    % It must also be present in the smoothed raw trace; a dip seen only in the
+    % filtered trace is filter ringing, not near field
+    nf = iMn(iMn < lo & z(iMn) < -thrNoise);
+    if ~isempty(nf)
+        [~, j] = min(z(nf));  k = nf(j);
+        if zs(k) < -opts.noiseK * F.noiseSmooth
+            P.tNearField = t(k);  P.aNearField = s * z(k);
+        else
+            P.tFilterDip = t(k);
+        end
+    end
+end
+% first sustained deflection beyond the noise band (near-field onset), on the
+% smoothed raw trace: the band-pass smears energy far ahead of an arrival
+nSus = max(3, round(0.05 * T.period / dt));
+ca = [0; cumsum(abs(zs) > opts.noiseK * F.noiseSmooth)];
+runLen = ca(nSus+1:end) - ca(1:end-nSus);                    % runLen(k) = number above in k:k+nSus-1
+kLast = min(numel(runLen), win(end) - nSus + 1);
+if kLast >= win(1)
+    k = find(runLen(win(1):kLast) == nSus, 1);
+    if ~isempty(k), P.tFirstDev = t(win(1) + k - 1); end
+end
+% dominant receiver frequency: same estimator as T.f.spectralPeak (unfiltered)
+seg = zeros(N, 1);  seg(win) = yRaw(win);
+nfft = fftLength(N, 16);
+Y = abs(fft(seg, nfft));  fa = (0:nfft-1).' / nfft / dt;
+half = 2:floor(nfft/2);  [~, im] = max(Y(half));
+P.fSpec = fa(half(im));
+end
+
+% =========================================================================
+%                     CROSS-CORRELATION / CROSS-SPECTRUM
+% =========================================================================
+function C = crossCorr(x, y, dt, T, opts, useEnvelope)
+if useEnvelope, a = envAnalytic(x); b = envAnalytic(y); else, a = x; b = y; end
+a = a - mean(a);  b = b - mean(b);
+N = numel(a);  nfft = 2^nextpow2(2*N);
+c = real(ifft(fft(b, nfft) .* conj(fft(a, nfft))));          % c(k) = sum b(n+k) a(n)
+c = [c(end-N+2:end); c(1:N)];  lags = (-(N-1):(N-1)).';
+c = c / max(eps, sqrt(sum(a.^2) * sum(b.^2)));                % normalised coefficient
+tl = lags * dt;
+lagMax = (N-1)*dt;
+if ~isempty(opts.maxTravelTime), lagMax = opts.maxTravelTime; end
+ok = tl >= opts.minTravelTime & tl <= lagMax;
+C.c = c;  C.tl = tl;  C.envelope = useEnvelope;
+C.lag = NaN;  C.peak = NaN;  C.ok = false;  C.secondLag = NaN;  C.secondPeak = NaN;
+C.tShiftStart = NaN;
+idx = find(ok);
+if isempty(idx), return; end
+[pk, j] = max(c(idx));  k = idx(j);
+lag = tl(k);
+% a maximum on the edge of the lag window is not a peak: the real one lies outside
+atEdge = k == idx(1) || k == idx(end);
+if ~atEdge && c(k) >= c(k-1) && c(k) >= c(k+1)               % parabolic refinement
+    den = c(k-1) - 2*c(k) + c(k+1);
+    if den < 0, lag = lag + 0.5 * (c(k-1) - c(k+1)) / den * dt; end
+end
+C.lag = lag;  C.peak = pk;
+C.ok = pk > 0 && ~atEdge;
+if ~useEnvelope
+    % runner-up peak: a second CC peak close in height means the pick is ambiguous
+    d = diff(c);  loc = find([false; d(1:end-1) > 0 & d(2:end) <= 0; false] & ok);
+    loc(abs(tl(loc) - tl(k)) < 0.5 * T.period) = [];          % ignore ripples on the main peak
+    if ~isempty(loc)
+        [C.secondPeak, j2] = max(c(loc)); C.secondLag = tl(loc(j2));
+    end
+    if C.secondPeak > 0.8 * pk
+        warning('BE:ccAmbiguous', ['Cross-correlation has a second peak at %.1f us that is %.0f %% ' ...
+            'of the maximum; the CC pick may be cycle-skipped.'], 1e6*C.secondLag, 100*C.secondPeak/pk);
+    end
+end
+C.tShiftStart = T.tStart + lag;
+end
+
+function S = crossSpectrum(x, y, fs, f0, F)
+N = numel(x);  nfft = fftLength(N, 8);
+X = fft(x, nfft);  Y = fft(y, nfft);
+f = (0:nfft-1).' * fs / nfft;
+G = Y .* conj(X);
+half = (1:floor(nfft/2)).';
+band = [max(0.5*f0, F.band(1)), min(1.5*f0, F.band(2))];
+m = half(f(half) >= band(1) & f(half) <= band(2));
+m = m(abs(X(m)) >= 0.3 * max(abs(X(half))));                 % keep frequencies the tx excites
+phAll = unwrap(angle(G(half)));
+S.f = f(half);  S.Gmag = abs(G(half));  S.phase = phAll;
+S.X = abs(X(half));  S.Y = abs(Y(half));
+S.band = [NaN NaN];  S.tau = NaN;  S.R2 = NaN;  S.ok = false;
+S.fFit = [];  S.phFit = [];  S.phModel = [];
+if numel(m) < 3, return; end
+S.band = [f(m(1)) f(m(end))];
+ph = phAll(m);
+w  = abs(G(m));  w = w / max(eps, max(w));
+Aw = [ones(numel(m),1) 2*pi*f(m)] .* sqrt(w);
+p  = Aw \ (ph .* sqrt(w));                                    % weighted LS: ph = p1 + p2*2*pi*f
+S.tau = -p(2);
+res = ph - (p(1) + p(2)*2*pi*f(m));
+S.R2 = 1 - sum(w .* res.^2) / sum(w .* (ph - sum(w.*ph)/sum(w)).^2);
+S.ok = S.tau > 0 && S.R2 > 0.9;
+S.fFit = f(m);  S.phFit = ph;  S.phModel = p(1) + p(2)*2*pi*f(m);
+end
+
+% =========================================================================
+%                     CROSSTALK FLAGS, VELOCITY AND GMAX
+% =========================================================================
+function M = flagRows(M, mask, why)
+% mark the selected methods [CHECK] and say why in their note
+for k = find(mask(:).')
+    if isnan(M(k).Ts), continue; end
+    M(k).quality = 'check';
+    M(k).note = [M(k).note '; ' why];
+end
+end
+
+function M = addVelocity(M, opts, f0, fRx)
+L = [];
+if ~isempty(opts.L), L = opts.L;
+elseif ~isempty(opts.H_i) && ~isempty(opts.H_b), L = opts.H_i - opts.dH_c - opts.H_b;   % D8295 §7.3
+end
+if ~isempty(L) && L <= 0
+    warning('BE:geometry', 'Travel length L = H_i - dH_c - H_b = %.4g m is not positive; Vs not computed.', L);
+    L = [];
+end
+for k = 1:numel(M)
+    Ts = M(k).Ts;
+    M(k).Ts_us = 1e6 * Ts;
+    M(k).wavelengthsInPath_tx = f0 * (Ts - opts.Tc);   % L/lambda = f*(Ts - Tc), independent of L
+    M(k).wavelengthsInPath_rx = fRx * (Ts - opts.Tc);  % same with the rx peak-to-trough frequency
+    M(k).Vs = NaN;  M(k).Gmax_MPa = NaN;
+    if ~isempty(L) && Ts - opts.Tc > 0
+        M(k).Vs = L / (Ts - opts.Tc);                    % D8295 Eq. 1
+        if ~isempty(opts.rho), M(k).Gmax_MPa = opts.rho * M(k).Vs^2 / 1e6; end   % Eq. 3
+    end
+end
+end
+
+% =========================================================================
+%                              PLOTTING
+% =========================================================================
+function info = figInfo(TX, RX, T, F, opts)
+info.ftxLine = sprintf('f_{tx} = %.3f kHz  (full period %.1f \\mus; peak-trough: %.3f kHz)', ...
+    T.f.primary/1e3, 1e6*T.period, T.f.peakTrough/1e3);
+switch F.type
+    case 'none', info.filtLine = 'receiver: unfiltered';
+    case 'fft',  info.filtLine = sprintf('receiver: zero-phase FFT band-pass %.2f-%.1f kHz', F.band/1e3);
+    otherwise,   info.filtLine = sprintf('receiver: Butterworth (order %d, filtfilt) %.2f-%.1f kHz', ...
+                    opts.butterOrder, F.band/1e3);
+end
+info.files = sprintf('Tx: %s   |   Rx: %s', esc(TX.name), esc(RX.name));
+if opts.rxPolarity < 0, info.files = [info.files '   |   Rx inverted']; end
+info.vis = 'on';  if ~opts.showFigures, info.vis = 'off'; end
+info.countsMode = strcmp(TX.mode, 'ADC counts') || strcmp(RX.mode, 'ADC counts');
+end
+
+function fig = newFig(name, info)
+fig = figure('Name', name, 'Color', 'w', 'Visible', info.vis, 'Units', 'pixels', ...
+    'Position', [80 80 1100 760]);
+end
+
+function ax = dualAxes(ax, tus, x, tusR, yrRaw, yF)
+% transmitter (V) on the left axis, receiver (mV) on the right axis - D8295 Fig. 3 style
+yyaxis(ax, 'left');
+plot(ax, tus, x, '--', 'Color', [0 0.30 0.70], 'LineWidth', 1.4, 'DisplayName', 'Transmitter');
+hold(ax, 'on');
+ylabel(ax, 'Transmitter signal (V)');
+yl = max(abs(x)) * 1.15;  if ~(yl > 0), yl = 1; end
+ylim(ax, [-yl yl]);
+yyaxis(ax, 'right');
+hold(ax, 'on');
+if ~isempty(yrRaw)
+    plot(ax, tusR, 1e3*yrRaw, '-', 'Color', [0.85 0.55 0.45], 'LineWidth', 0.5, 'DisplayName', 'Receiver (raw)');
+end
+plot(ax, tusR, 1e3*yF, '-', 'Color', [0.70 0.10 0.05], 'LineWidth', 1.6, 'DisplayName', 'Receiver (filtered)');
+ylabel(ax, 'Receiver signal (mV)');
+r = max(abs(1e3*[yF(:); yrRaw(:)])) * 1.15;  if ~(r > 0), r = 1; end
+ylim(ax, [-r r]);
+ax.YAxis(1).Color = [0 0.30 0.70];  ax.YAxis(2).Color = [0.70 0.10 0.05];
+grid(ax, 'on');  box(ax, 'on');
+xlabel(ax, 'Time from transmitter start (\mus)');
+end
+
+function fig = plotOverview(t, x, yr, y, T, F, P, info, opts)
+fig = newFig('BE overview', info);
+tl = tiledlayout(fig, 2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+tus = 1e6 * (t - T.tStart);
+ax = nexttile(tl, [1 2]);
+dualAxes(ax, tus, x, tus, yr, y);
+yyaxis(ax, 'left');
+xline(ax, 0, ':k', 'tx start', 'HandleVisibility', 'off');
+xlim(ax, [tus(1) tus(end)]);
+legend(ax, 'Location', 'northeast');
+title(ax, {'Full records', info.filtLine});
+ax = nexttile(tl);
+plot(ax, 1e6*(t - T.tStart), x, 'Color', [0 0.3 0.7], 'LineWidth', 1.4); hold(ax, 'on');
+plot(ax, 1e6*([T.tStart T.tPeak T.tMid T.tTrough T.tEnd] - T.tStart), ...
+    [0 T.aPeak 0 T.aTrough 0], 'ko', 'MarkerFaceColor', 'y');
+grid(ax, 'on');  xlim(ax, 1e6*[-0.3 1.3]*T.period);
+xlabel(ax, 'Time from transmitter start (\mus)');  ylabel(ax, 'Transmitter (V)');
+title(ax, {'Transmitter pulse and frequency', info.ftxLine});
+ax = nexttile(tl);
+nfft = fftLength(numel(x), 8);  fa =(0:nfft/2-1).' / nfft / (t(2)-t(1));
+Xs = abs(fft(x, nfft));  Yr = abs(fft(yr, nfft));  Yf = abs(fft(y, nfft));
+Xs = Xs(1:nfft/2); Yr = Yr(1:nfft/2); Yf = Yf(1:nfft/2);
+plot(ax, fa/1e3, Xs/max(eps, max(Xs)), 'Color', [0 0.3 0.7], 'LineWidth', 1.3, 'DisplayName', 'Transmitter'); hold(ax, 'on');
+plot(ax, fa/1e3, Yr/max(eps, max(Yf)), 'Color', [0.85 0.55 0.45], 'DisplayName', 'Receiver raw');
+plot(ax, fa/1e3, Yf/max(eps, max(Yf)), 'Color', [0.7 0.1 0.05], 'LineWidth', 1.3, 'DisplayName', 'Receiver filtered');
+plot(ax, F.fAxis/1e3, F.H, 'k:', 'LineWidth', 1.1, 'DisplayName', 'Filter gain');
+xline(ax, T.f.primary/1e3, '--', sprintf('f_{tx} %.2f kHz', T.f.primary/1e3), 'Color', [0 0.3 0.7], 'HandleVisibility', 'off');
+if ~isnan(P.fSpec)
+    xline(ax, P.fSpec/1e3, '--', sprintf('f_{rx} %.2f kHz', P.fSpec/1e3), 'Color', [0.7 0.1 0.05], ...
+        'LabelHorizontalAlignment', 'left', 'HandleVisibility', 'off');
+end
+grid(ax, 'on');  xlim(ax, [0 min(fa(end), 8*T.f.primary)/1e3]);  ylim(ax, [0 1.3]);
+xlabel(ax, 'Frequency (kHz)');  ylabel(ax, 'Normalised amplitude');
+legend(ax, 'Location', 'northeast');  title(ax, 'Amplitude spectra (f_{rx}: spectral peak, unfiltered)');
+title(tl, {'Bender element records', info.files}, 'FontWeight', 'bold');
+if info.countsMode
+    annotation(fig, 'textbox', [0.01 0.0 0.98 0.03], 'String', ...
+        sprintf(['Amplitudes scaled as counts x (V/div) / %g; this factor is not verified for your scope ' ...
+        'and affects amplitudes only, not times.'], opts.countsPerDiv), ...
+        'EdgeColor', 'none', 'FontSize', 8, 'Color', [0.4 0.4 0.4], 'Interpreter', 'none');
+end
+end
+
+function fig = plotS2S(t, x, yr, y, T, P, m, X, info)
+fig = newFig('Start to Start', info);
+tl = tiledlayout(fig, 2, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+tus = 1e6 * (t - T.tStart);
+xr = 1e6 * [-0.3*T.period, max(1.6*T.period, (P.tPeak1 - T.tStart) + 0.6*T.period)];
+haveArr = ~isnan(P.tArrival);
+for pane = 1:2
+    ax = nexttile(tl);
+    dualAxes(ax, tus, x, tus, yr, y);
+    yyaxis(ax, 'right');
+    yline(ax, 0, '-', 'Color', [0.3 0.3 0.3], 'HandleVisibility', 'off');
+    if X.detected
+        xregion(ax, 1e6*(X.window(1) - T.tStart), 1e6*(X.window(2) - T.tStart), ...
+            'FaceColor', [0.6 0.6 0.6], 'FaceAlpha', 0.15, 'DisplayName', 'Crosstalk window');
+    end
+    if ~isnan(P.tNearField)
+        plot(ax, 1e6*(P.tNearField - T.tStart), 1e3*P.aNearField, 'v', 'Color', [0.5 0 0.5], ...
+            'MarkerFaceColor', [0.8 0.6 0.9], 'MarkerSize', 8, 'DisplayName', 'Near-field excursion');
+    end
+    if haveArr
+        plot(ax, 1e6*(P.tArrival - T.tStart), 0, 'o', 'Color', [0.7 0.1 0.05], 'MarkerFaceColor', 'y', ...
+            'MarkerSize', 9, 'DisplayName', 'Rx arrival (baseline crossing)');
+    end
+    yyaxis(ax, 'left');
+    plot(ax, 0, 0, 's', 'Color', [0 0.3 0.7], 'MarkerFaceColor', 'y', 'MarkerSize', 9, ...
+        'DisplayName', 'Tx start');
+    xline(ax, 0, ':', 'Color', [0 0.3 0.7], 'HandleVisibility', 'off');
+    if haveArr
+        xline(ax, 1e6*(P.tArrival - T.tStart), ':', 'Color', [0.7 0.1 0.05], 'HandleVisibility', 'off');
+    end
+    if pane == 1
+        xlim(ax, xr);  legend(ax, 'Location', 'southwest');
+        if haveArr
+            drawSpan(ax, 0, 1e6*(P.tArrival - T.tStart), sprintf('T_s = %.1f \\mus', 1e6*m.Ts), 0.88);
+            title(ax, {sprintf('Start to Start (ASTM D8295 §10.1.2):  T_s = %.1f \\mus', 1e6*m.Ts), info.ftxLine});
+        else
+            title(ax, {'Start to Start (ASTM D8295 §10.1.2):  not determined', info.ftxLine});
+        end
+    elseif haveArr
+        c = 1e6*(P.tArrival - T.tStart);  w = 1e6*0.35*T.period;
+        xlim(ax, [c - w, c + w]);
+        title(ax, 'Zoom on the receiver arrival');
+    else
+        xlim(ax, xr);
+        title(ax, 'Zoom on the receiver arrival: no arrival picked');
+    end
+end
+title(tl, info.files, 'FontWeight', 'normal', 'FontSize', 9);
+end
+
+function fig = plotPeaks(t, x, yr, y, T, P, mP, mT, info)
+fig = newFig('Peak to Peak', info);
+tl = tiledlayout(fig, 2, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+tus = 1e6 * (t - T.tStart);
+xr = 1e6 * [-0.3*T.period, max(1.8*T.period, (P.tPeak1 - T.tStart) + 1.2*T.period)];
+spec = {mP, T.tPeak, T.aPeak, P.tPeak1, P.aPeak1, 'peak', ...
+        'Peak to Peak (ASTM D8295 §10.1.1)'; ...
+        mT, T.tTrough, T.aTrough, P.tTrough1, P.aTrough1, 'trough', ...
+        'Trough to Trough (second-lobe check, not part of D8295)'};
+for pane = 1:2
+    [m, ttx, atx, trx, arx, word, ttl] = spec{pane, :};
+    ax = nexttile(tl);
+    dualAxes(ax, tus, x, tus, yr, y);
+    yyaxis(ax, 'right');
+    if ~isnan(trx)
+        plot(ax, 1e6*(trx - T.tStart), 1e3*arx, 'o', 'Color', [0.7 0.1 0.05], 'MarkerFaceColor', 'y', ...
+            'MarkerSize', 9, 'DisplayName', ['Rx 1st ' word]);
+        xline(ax, 1e6*(trx - T.tStart), ':', 'Color', [0.7 0.1 0.05], 'HandleVisibility', 'off');
+    end
+    yyaxis(ax, 'left');
+    plot(ax, 1e6*(ttx - T.tStart), atx, 's', 'Color', [0 0.3 0.7], 'MarkerFaceColor', 'y', ...
+        'MarkerSize', 9, 'DisplayName', ['Tx ' word]);
+    xline(ax, 1e6*(ttx - T.tStart), ':', 'Color', [0 0.3 0.7], 'HandleVisibility', 'off');
+    xlim(ax, xr);  legend(ax, 'Location', 'southwest');
+    if isnan(m.Ts)
+        title(ax, {[ttl ':  not determined'], info.ftxLine});
+    else
+        drawSpan(ax, 1e6*(ttx - T.tStart), 1e6*(trx - T.tStart), sprintf('T_s = %.1f \\mus', 1e6*m.Ts), 0.90);
+        title(ax, {sprintf('%s:  T_s = %.1f \\mus', ttl, 1e6*m.Ts), info.ftxLine});
+    end
+end
+title(tl, info.files, 'FontWeight', 'normal', 'FontSize', 9);
+end
+
+function fig = plotCC(t, a, b, C, T, m, info, ttl)
+fig = newFig(ttl, info);
+tl = tiledlayout(fig, 3, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+tus = 1e6 * (t - T.tStart);
+lag = C.lag;  if isnan(lag), lag = 0; end
+xr = 1e6 * [-0.3*T.period, max(2*T.period, lag + 1.5*T.period)];
+% (1) the two signals that are correlated
+ax = nexttile(tl);
+dualAxes(ax, tus, a, tus, [], b);
+xlim(ax, xr);  legend(ax, 'Location', 'northeast');
+if C.envelope, title(ax, {'Signal envelopes (|analytic signal|)', info.ftxLine});
+else,          title(ax, {'Transmitter and filtered receiver', info.ftxLine});
+end
+% (2) the cross-correlation function
+ax = nexttile(tl);
+plot(ax, 1e6*C.tl, C.c, 'k-', 'LineWidth', 1.2, 'DisplayName', 'Normalised CC'); hold(ax, 'on');
+if ~isnan(C.lag)
+    plot(ax, 1e6*C.lag, C.peak, 'o', 'Color', [0.7 0.1 0.05], 'MarkerFaceColor', 'y', 'MarkerSize', 9, ...
+        'DisplayName', sprintf('max at %.1f \\mus (CC = %.3f)', 1e6*C.lag, C.peak));
+end
+if ~isnan(C.secondLag)
+    plot(ax, 1e6*C.secondLag, C.secondPeak, 'd', 'Color', [0.4 0.4 0.4], 'MarkerSize', 8, ...
+        'DisplayName', sprintf('runner-up at %.1f \\mus (%.0f %%)', 1e6*C.secondLag, 100*C.secondPeak/C.peak));
+end
+xline(ax, 0, ':k', 'HandleVisibility', 'off');
+grid(ax, 'on');  xlim(ax, [-xr(2) xr(2)]);  ylim(ax, [-1 1]);
+xlabel(ax, 'Lag of receiver relative to transmitter (\mus)');  ylabel(ax, 'Normalised CC');
+legend(ax, 'Location', 'southwest');
+if isnan(m.Ts), title(ax, sprintf('%s:  not determined', ttl));
+else,           title(ax, sprintf('%s:  T_s = %.1f \\mus', ttl, 1e6*m.Ts));
+end
+% (3) alignment check: transmitter shifted by the CC lag over the receiver
+ax = nexttile(tl);
+plot(ax, tus + 1e6*lag, a / max(eps, max(abs(a))), '--', 'Color', [0 0.3 0.7], 'LineWidth', 1.4, ...
+    'DisplayName', sprintf('Transmitter shifted by %.1f \\mus', 1e6*lag)); hold(ax, 'on');
+plot(ax, tus, b / max(eps, max(abs(b))), '-', 'Color', [0.7 0.1 0.05], 'LineWidth', 1.6, 'DisplayName', 'Receiver');
+grid(ax, 'on');  xlim(ax, xr);  ylim(ax, [-1.15 1.15]);
+xlabel(ax, 'Time from transmitter start (\mus)');  ylabel(ax, 'Normalised amplitude');
+legend(ax, 'Location', 'southwest');  title(ax, 'Alignment check (each trace scaled to its own maximum)');
+title(tl, info.files, 'FontWeight', 'normal', 'FontSize', 9);
+end
+
+function fig = plotCPS(S, m, f0, info)
+fig = newFig('Cross-power spectrum', info);
+tl = tiledlayout(fig, 2, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+haveFit = ~any(isnan(S.band));
+if haveFit, fmax = min(S.f(end), 4 * mean(S.band)); else, fmax = min(S.f(end), 4 * f0); end
+ax = nexttile(tl);
+plot(ax, S.f/1e3, S.X/max(eps, max(S.X)), '--', 'Color', [0 0.3 0.7], 'LineWidth', 1.4, 'DisplayName', '|Transmitter|'); hold(ax, 'on');
+plot(ax, S.f/1e3, S.Y/max(eps, max(S.Y)), '-', 'Color', [0.7 0.1 0.05], 'LineWidth', 1.4, 'DisplayName', '|Receiver (filtered)|');
+plot(ax, S.f/1e3, S.Gmag/max(eps, max(S.Gmag)), 'k:', 'LineWidth', 1.2, 'DisplayName', '|Cross-power spectrum|');
+if haveFit
+    xregion(ax, S.band(1)/1e3, S.band(2)/1e3, 'FaceColor', [0.9 0.8 0.3], 'FaceAlpha', 0.25, 'DisplayName', 'Fit band');
+end
+grid(ax, 'on');  xlim(ax, [0 fmax/1e3]);  ylim(ax, [0 1.15]);
+xlabel(ax, 'Frequency (kHz)');  ylabel(ax, 'Normalised magnitude');  legend(ax, 'Location', 'northeast');
+title(ax, {'Amplitude spectra of both signals', info.ftxLine});
+ax = nexttile(tl);
+k = S.f <= fmax;
+plot(ax, S.f(k)/1e3, S.phase(k), '-', 'Color', [0.6 0.6 0.6], 'DisplayName', 'Unwrapped phase'); hold(ax, 'on');
+if haveFit
+    plot(ax, S.fFit/1e3, S.phFit, 'k.', 'MarkerSize', 8, 'DisplayName', 'Fitted points');
+    plot(ax, S.fFit/1e3, S.phModel, 'r-', 'LineWidth', 1.8, ...
+        'DisplayName', sprintf('slope \\rightarrow \\tau = %.1f \\mus (R^2 = %.3f)', 1e6*S.tau, S.R2));
+end
+grid(ax, 'on');  xlim(ax, [0 fmax/1e3]);
+xlabel(ax, 'Frequency (kHz)');  ylabel(ax, 'Phase of cross-power spectrum (rad)');  legend(ax, 'Location', 'southwest');
+if haveFit
+    title(ax, sprintf('Cross-power spectrum phase slope (group delay):  T_s = %.1f \\mus', 1e6*m.Ts));
+else
+    title(ax, 'Cross-power spectrum phase slope: no usable fit band');
+end
+title(tl, info.files, 'FontWeight', 'normal', 'FontSize', 9);
+end
+
+function fig = plotSummary(M, Craw, info, opts)
+fig = newFig('Summary', info);
+ax = axes(fig);
+n = numel(M);  ts = [M.Ts_us];
+cols = zeros(n, 3);
+for k = 1:n
+    if contains(M(k).basis, 'ASTM'),         cols(k, :) = [0.10 0.45 0.25];
+    elseif contains(M(k).basis, 'informational'), cols(k, :) = [0.65 0.65 0.65];
+    else,                                    cols(k, :) = [0.25 0.40 0.75];
+    end
+end
+b = barh(ax, 1:n, ts, 'FaceColor', 'flat');  b.CData = cols;
+hold(ax, 'on');
+for k = 1:n
+    if isnan(ts(k)), lab = '  not determined'; else, lab = sprintf('  %.1f \\mus', ts(k)); end
+    if ~isnan(M(k).Vs), lab = [lab sprintf('   V_s = %.0f m/s', M(k).Vs)]; end           %#ok<AGROW>
+    if ~isnan(M(k).Gmax_MPa), lab = [lab sprintf('   G_{max} = %.0f MPa', M(k).Gmax_MPa)]; end %#ok<AGROW>
+    if ~strcmp(M(k).quality, 'ok'), lab = [lab '   (check)']; end                           %#ok<AGROW>
+    text(ax, max(0, ts(k)), k, lab, 'VerticalAlignment', 'middle', 'FontSize', 9);
+end
+std2 = mean(ts(1:2), 'omitnan');
+if ~isnan(std2)
+    xline(ax, std2, '--', sprintf('mean of D8295 methods %.1f \\mus', std2), 'Color', [0.10 0.45 0.25]);
+end
+set(ax, 'YTick', 1:n, 'YTickLabel', {M.name}, 'YDir', 'reverse');
+good = ts(~isnan(ts));
+if isempty(good), good = 1; end
+xlo = min(0, min(good));  xhi = 1.6 * max(good);
+if ~(xhi > xlo), xhi = xlo + 1; end
+xlim(ax, [xlo, xhi]);
+grid(ax, 'on');  xlabel(ax, 'Shear-wave travel time T_s (\mus)');
+title(ax, {'Travel time by method', info.ftxLine, ...
+    'green: ASTM D8295   blue: other methods (§10.2, need validation)   grey: informational', ...
+    sprintf('unfiltered-receiver CC check: %.1f \\mus   |   T_c = %.1f \\mus', 1e6*Craw.lag, 1e6*opts.Tc)});
+end
+
+function drawSpan(ax, x1, x2, label, yFrac)
+if ~(isfinite(x1) && isfinite(x2)), return; end
+yl = ylim(ax);  yv = yl(1) + yFrac * diff(yl);
+plot(ax, [x1 x2], [yv yv], 'k-', 'LineWidth', 1.1, 'HandleVisibility', 'off');
+plot(ax, [x1 x2], [yv yv], 'k|', 'MarkerSize', 12, 'LineWidth', 1.1, 'HandleVisibility', 'off');
+text(ax, (x1 + x2)/2, yv, label, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom', ...
+    'FontWeight', 'bold', 'BackgroundColor', 'w', 'Margin', 1);
+end
+
+function [ts, ok] = manualPick(t, x, y, T, info)
+info.vis = 'on';                                   % the pick needs a visible figure
+fig = newFig('Manual pick', info);  ax = axes(fig);
+tus = 1e6 * (t - T.tStart);
+dualAxes(ax, tus, x, tus, [], y);
+xlim(ax, 1e6 * [-0.3 3] * T.period);
+title(ax, {'Manual pick: click 1) the transmitter reference point, 2) the matching receiver point', ...
+    'Use the same feature on both traces (start/start or peak/peak). Press Enter to skip.'});
+[gx, ~] = ginput(2);
+ok = numel(gx) == 2 && gx(2) > gx(1);
+if ok
+    ts = 1e-6 * (gx(2) - gx(1));
+    yyaxis(ax, 'left');  xline(ax, gx(1), 'b-');  yyaxis(ax, 'right');  xline(ax, gx(2), 'r-');
+else
+    ts = NaN;
+end
+end
+
+% =========================================================================
+%                              REPORT / OUTPUT
+% =========================================================================
+function printReport(R, fid)
+if nargin < 2, fid = 1; end
+T = R.transmitter;  F = R.filter;  P = R.picks;  M = R.methods;  o = R.options;  X = R.crosstalk;
+[~, a, b] = fileparts(R.files.tx);  [~, c, d] = fileparts(R.files.rx);
+fprintf(fid, '\n=== Bender element travel-time analysis (ASTM D8295-19) ===\n');
+fprintf(fid, 'Transmitter file : %s\nReceiver file    : %s\n', [a b], [c d]);
+fprintf(fid, 'Sampling period  : %.3g us  (%.3g MHz), %d points, record %.1f us\n', ...
+    1e6*R.dt, 1e-6/R.dt, numel(T.x), 1e6*R.dt*numel(T.x));
+fprintf(fid, '\nTransmitter pulse\n');
+fprintf(fid, '  start (5-30%% rise extrapolated) : %8.2f us after record start (crossing: %.2f us)\n', ...
+    1e6*T.tStart, 1e6*T.tStartCrossing);
+fprintf(fid, '  frequency, full period            : %8.3f kHz   <- used\n', T.f.fullPeriod/1e3);
+fprintf(fid, '  frequency, 1st / 2nd half period  : %8.3f / %.3f kHz\n', T.f.halfPeriod1/1e3, T.f.halfPeriod2/1e3);
+fprintf(fid, '  frequency, peak-to-trough x 2     : %8.3f kHz\n', T.f.peakTrough/1e3);
+fprintf(fid, '  spectral peak (1-cycle burst)     : %8.3f kHz  (sits below the nominal f for a single cycle)\n', ...
+    T.f.spectralPeak/1e3);
+fprintf(fid, '  amplitude (peak / trough)         : %+.2f / %+.2f V (scaled, see countsPerDiv)\n', T.aPeak, T.aTrough);
+fprintf(fid, '\nReceiver\n');
+fprintf(fid, '  filter            : %s, band %.2f-%.2f kHz\n', F.type, F.band/1e3);
+fprintf(fid, '  noise (pre-trigger, robust std): raw %.3g mV, filtered %.3g mV; peak SNR %.0f (minimum %g)\n', ...
+    1e3*F.noiseRaw, 1e3*F.noiseFilt, P.snr, o.minSNR);
+fprintf(fid, '  frequency, peak-to-trough x 2   : %.3f kHz  (rx / tx = %.2f)\n', ...
+    P.fPeakTrough/1e3, P.fPeakTrough/T.f.peakTrough);
+fprintf(fid, '  frequency, spectral peak        : %.3f kHz  (rx / tx = %.2f)\n', ...
+    P.fSpec/1e3, P.fSpec/T.f.spectralPeak);
+fprintf(fid, '  (D8295 §9.8 expects the received frequency to be about the transmitted one)\n');
+if ~isnan(P.tNearField)
+    fprintf(fid, '  near-field excursion at %.1f us after tx start (%.3g mV)\n', ...
+        1e6*(P.tNearField - T.tStart), 1e3*P.aNearField);
+end
+if ~isnan(P.tFilterDip)
+    fprintf(fid, ['  dip at %.1f us after tx start is in the filtered trace only (filter ringing), ' ...
+        'not reported as near field\n'], 1e6*(P.tFilterDip - T.tStart));
+end
+if X.detected
+    fprintf(fid, ['  CROSSTALK: %.3g mV while the transmitter is active (correlation %.2f); ' ...
+        'picks earlier than %.1f us are marked [CHECK]\n'], 1e3*X.amp, X.corr, 1e6*X.minTravelTimeHint);
+end
+if o.minTravelTime > 0
+    fprintf(fid, '  picks restricted to travel times >= %.1f us (opts.minTravelTime)\n', 1e6*o.minTravelTime);
+end
+fprintf(fid, '\n  %-28s %-34s %9s %8s %8s %9s  %s\n', 'Method', 'Basis', 'Ts (us)', 'f*Ts', ...
+    'Vs(m/s)', 'Gmax(MPa)', 'Note');
+for k = 1:numel(M)
+    fprintf(fid, '  %-28s %-34s %9.1f %8.2f %8.0f %9.1f  %s%s\n', M(k).name, M(k).basis, M(k).Ts_us, ...
+        M(k).wavelengthsInPath_tx, M(k).Vs, M(k).Gmax_MPa, M(k).note, ...
+        ternary(strcmp(M(k).quality, 'ok'), '', '  [CHECK]'));
+end
+fprintf(fid, '  Filter-sensitivity check, CC on the UNFILTERED receiver: %.1f us\n', 1e6*R.ccRaw.lag);
+fprintf(fid, '  f*Ts = travel path length in transmitted wavelengths (L/lambda); Tc = %.2f us applied.\n', 1e6*o.Tc);
+if o.Tc == 0
+    fprintf(fid, '  NOTE: Tc = 0. D8295 §8.1 asks for a tip-to-tip calibration of the system delay.\n');
+end
+s2s = M(1).Ts;  p2p = M(2).Ts;
+if ~isnan(s2s) && ~isnan(p2p)
+    fprintf(fid, '  Start-to-Start vs Peak-to-Peak differ by %.1f us (%.0f %% of their mean).\n', ...
+        1e6*abs(s2s - p2p), 200*abs(s2s - p2p)/abs(s2s + p2p));
+end
+fprintf(fid, '\n');
+end
+
+function folder = saveOutputs(R, figs, opts)
+folder = opts.outputFolder;
+if isempty(folder)
+    [p, n] = fileparts(R.files.rx);
+    folder = fullfile(p, ['BE_results_' n]);
+end
+if ~exist(folder, 'dir')
+    [ok, msg] = mkdir(folder);
+    if ~ok, error('BE:save', 'Cannot create the output folder %s: %s', folder, msg); end
+end
+for k = 1:numel(figs)
+    if ~isgraphics(figs(k)), continue; end
+    nm = regexprep(get(figs(k), 'Name'), '[^\w]+', '_');
+    try
+        exportgraphics(figs(k), fullfile(folder, sprintf('%02d_%s.png', k, nm)), 'Resolution', 200);
+    catch err
+        warning('BE:save', 'Figure "%s" not saved: %s', get(figs(k), 'Name'), err.message);
+    end
+end
+% methods table (plain CSV, readable anywhere)
+fid = openOrFail(fullfile(folder, 'travel_times.csv'));
+fprintf(fid, 'Method,Basis,Ts_s,Ts_us,f_tx_times_Ts,Vs_m_s,Gmax_MPa,Quality,Note\n');
+M = R.methods;
+for k = 1:numel(M)
+    fprintf(fid, '"%s","%s",%.9g,%.3f,%.4f,%.4g,%.4g,%s,"%s"\n', M(k).name, M(k).basis, M(k).Ts, ...
+        M(k).Ts_us, M(k).wavelengthsInPath_tx, M(k).Vs, M(k).Gmax_MPa, M(k).quality, strrep(M(k).note, '"', ''''));
+end
+fclose(fid);
+fid = openOrFail(fullfile(folder, 'report.txt'));  printReport(R, fid);  fclose(fid);
+Rsave = rmfield(R, 'figures');  %#ok<NASGU>
+save(fullfile(folder, 'BE_results.mat'), 'Rsave');
+fprintf('Results saved in: %s\n', folder);
+end
+
+function fid = openOrFail(file)
+fid = fopen(file, 'w');
+if fid < 0, error('BE:save', 'Cannot write %s (file open in another program?).', file); end
+end
+
+% =========================================================================
+%                              HELPERS
+% =========================================================================
+function r = mrow(name, tag, basis, Ts, ok, note)
+if ok && ~isnan(Ts) && Ts > 0, q = 'ok'; else, q = 'check'; end
+r = struct('name', name, 'tag', tag, 'basis', basis, 'Ts', Ts, 'quality', q, 'note', note);
+end
+
+function m = movingMean(v, n)
+% centred moving average over n samples, shortened at the ends (as movmean),
+% computed from a cumulative sum: O(N) time and memory for any window length
+v = v(:);  N = numel(v);  i = (1:N).';
+kb = floor(n/2);  kf = n - 1 - kb;
+lo = max(1, i - kb);  hi = min(N, i + kf);
+mu = mean(v);  c = [0; cumsum(v - mu)];
+m = (c(hi + 1) - c(lo)) ./ (hi - lo + 1) + mu;
+end
+
+function n = fftLength(N, factor)
+% zero-padded FFT length for spectral peaks: factor x N, but not beyond 2^20
+% points unless the record itself is longer
+n = 2^nextpow2(max(N, min(factor * N, 2^20)));
+end
+
+function tc = crossTime(t, z, k)
+% time where z crosses zero between samples k and k+1 (linear interpolation)
+k = max(1, min(numel(z) - 1, k));
+if z(k+1) == z(k), tc = t(k); return; end
+tc = t(k) - z(k) * (t(k+1) - t(k)) / (z(k+1) - z(k));
+end
+
+function tr = flankRoot(t, z, idx, zLo, zHi)
+% zero of a straight line fitted to the samples of one flank with zLo <= z <= zHi
+idx = idx(:);
+use = idx(z(idx) >= zLo & z(idx) <= zHi);
+if numel(use) >= 3 && numel(unique(z(use))) >= 2
+    dt = t(2) - t(1);  t0 = t(use(1));
+    p = polyfit((t(use) - t0) / dt, z(use), 1);
+    if p(1) ~= 0, tr = t0 - dt * p(2) / p(1); return; end
+end
+k = idx(find(z(idx(1:end-1)) .* z(idx(2:end)) <= 0 & z(idx(2:end)) ~= z(idx(1:end-1)), 1));
+if isempty(k), tr = t(idx(1)); else, tr = crossTime(t, z, k); end
+end
+
+function [tp, ap] = refineExtremum(t, z, i1, i2, sgn)
+% sub-sample extremum: quadratic least-squares fit to the top 10 % of the lobe
+i1 = max(1, i1);  i2 = min(numel(z), i2);
+w = sgn * z(i1:i2);
+[m, j] = max(w);  j = j + i1 - 1;
+lo = j;  while lo > i1 && sgn*z(lo-1) >= 0.9*m, lo = lo - 1; end
+hi = j;  while hi < i2 && sgn*z(hi+1) >= 0.9*m, hi = hi + 1; end
+if hi - lo >= 2
+    dt = t(2) - t(1);
+    tt = (t(lo:hi) - t(j)) / dt;                      % time in samples: well conditioned
+    p = polyfit(tt, z(lo:hi), 2);
+    tv = -p(2) / (2*p(1));
+    if sgn*p(1) < 0 && tv >= tt(1) && tv <= tt(end)
+        tp = t(j) + dt * tv;  ap = polyval(p, tv);  return;
+    end
+    tp = mean(t(lo:hi));  ap = z(j);  return;            % flat (clipped/quantised) top
+end
+tp = t(j);  ap = z(j);
+end
+
+function r = ncorr(a, b)
+% normalised correlation coefficient at zero lag
+a = a(:) - mean(a);  b = b(:) - mean(b);
+r = sum(a .* b) / max(eps, sqrt(sum(a.^2) * sum(b.^2)));
+end
+
+function s = robustStd(v)
+s = 1.4826 * median(abs(v - median(v)));
+if s == 0, s = std(v); end
+if s == 0, s = eps; end
+end
+
+function e = envAnalytic(v)
+% magnitude of the analytic signal (Hilbert envelope), base MATLAB only
+v = v(:);  N = numel(v);  h = zeros(N, 1);
+if mod(N, 2) == 0, h([1 N/2+1]) = 1; h(2:N/2) = 2;
+else,              h(1) = 1;         h(2:(N+1)/2) = 2;
+end
+e = abs(ifft(fft(v) .* h));
+end
+
+function s = esc(s)
+s = strrep(s, '_', '\_');
+end
+
+function out = ternary(c, a, b)
+if c, out = a; else, out = b; end
+end
