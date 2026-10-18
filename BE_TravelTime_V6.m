@@ -1327,7 +1327,7 @@ function cal = readCalibrationExcel(file)
 % (V4 workbooks, without the per-frequency columns, are read as all-model)
 if ~isfile(file), error('BE:file', 'Calibration workbook not found: %s', file); end
 S = readcell(file, 'Sheet', 'Summary');
-hdr = cellfun(@(c) char(string(c)), S(1, :), 'UniformOutput', false);
+hdr = cellfun(@cellText, S(1, :), 'UniformOutput', false);
 body = S(2:end, :);
 n = size(body, 1);
 has = @(name) any(strcmp(hdr, name));
@@ -1340,7 +1340,7 @@ cal.LL = num('L_over_lambda');  cal.LLff = num('L_over_lambda_farfield');
 cal.Ts = zeros(n, 7);  cal.quality = cell(n, 7);
 for j = 1:7
     cal.Ts(:, j) = 1e-6 * num(['Ts_' cal.tags{j} '_us']);
-    cal.quality(:, j) = cellfun(@(c) char(string(c)), col(['quality_' cal.tags{j}]), 'UniformOutput', false);
+    cal.quality(:, j) = cellfun(@cellText, col(['quality_' cal.tags{j}]), 'UniformOutput', false);
 end
 cal.VsPP = num('Vs_PP_m_s');  cal.VsS2S = num('Vs_S2S_m_s');
 cal.TppModel = 1e-6 * numOpt('Tpp_model_us');
@@ -1354,7 +1354,7 @@ cal.tPeakTx_ms = num('tx_peak_ms');  cal.tP_ms = num('P_arrival_ms');  cal.tS2S_
 cal.varChange = numOpt('variation_max_pct') / 100;  cal.varRms = numOpt('variation_rms_pct') / 100;
 cal.dPPvar = 1e-6 * numOpt('Tpp_change_by_variation_us');
 P = readcell(file, 'Sheet', 'Parameters');
-key = cellfun(@(c) char(string(c)), P(:, 1), 'UniformOutput', false);
+key = cellfun(@cellText, P(:, 1), 'UniformOutput', false);
 val = @(name) parameterValue(P, key, name);
 nPer = cellNum(val('waveform_columns'));                  % 2 in V4/V5 workbooks (tx, rx)
 if isnan(nPer), nPer = 2; end
@@ -1380,10 +1380,10 @@ cal.Tc = 1e-6 * cellNum(val('Tc_us'));
 cal.VsFF = cellNum(val('Vs_model_m_s'));
 cal.nfScale = cellNum(val('near_field_scale'));
 if isnan(cal.nfScale), cal.nfScale = 1; end
-cal.shape = char(string(val('waveform_shape')));
+cal.shape = cellText(val('waveform_shape'));
 if ~ismember(cal.shape, {'recorded', 'ideal'}), cal.shape = 'ideal'; end
-cal.source = char(string(val('source')));
-cal.created = char(string(val('created')));
+cal.source = cellText(val('source'));
+cal.created = cellText(val('created'));
 end
 
 function v = optionalColumn(present, num, name, n)
@@ -1393,6 +1393,15 @@ end
 function v = parameterValue(P, key, name)
 k = find(strcmp(key, name), 1);
 v = NaN;  if ~isempty(k), v = P{k, 2}; end
+end
+
+function s = cellText(c)
+% text of a spreadsheet cell; '' for an empty cell (readcell gives <missing>)
+s = '';
+if ischar(c), s = c;
+elseif isstring(c) && isscalar(c) && ~ismissing(c), s = char(c);
+elseif (isnumeric(c) || islogical(c)) && isscalar(c) && ~isnan(c), s = num2str(c);
+end
 end
 
 function v = cellNum(c)

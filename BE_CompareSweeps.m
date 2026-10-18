@@ -139,7 +139,7 @@ function D = readSweep(file, testF_kHz, cfg)
 if ~isfile(file), error('BEC:file', 'Workbook not found: %s', file); end
 [~, nm, ex] = fileparts(file);  D.file = file;  D.name = [nm ex];
 S = readcell(file, 'Sheet', 'Summary');
-hdr = cellfun(@(c) char(string(c)), S(1, :), 'UniformOutput', false);
+hdr = cellfun(@cellText, S(1, :), 'UniformOutput', false);
 body = S(2:end, :);  n = size(body, 1);
 has = @(name) any(strcmp(hdr, name));
 col = @(name) body(:, find(strcmp(hdr, name), 1));
@@ -151,7 +151,7 @@ end
 D.f = 1e3 * num('f_kHz');
 D.Ts = 1e-6 * num(['Ts_' cfg.method '_us']);
 D.TsPP = 1e-6 * num('Ts_P2P_us');
-D.ok = strcmp(cellfun(@(c) char(string(c)), col(['quality_' cfg.method]), 'UniformOutput', false), 'ok');
+D.ok = strcmp(cellfun(@cellText, col(['quality_' cfg.method]), 'UniformOutput', false), 'ok');
 D.userSet = false(n, 1);  if has('user_entered'), D.userSet = num('user_entered') == 1; end
 D.tPeakRx_ms = num('rx_peak_ms');  D.aPeakRxNorm = num('rx_peak_norm');  D.tPeakTx_ms = num('tx_peak_ms');
 D.tP_ms = NaN(n, 1);    if has('P_arrival_ms'), D.tP_ms = num('P_arrival_ms'); end
@@ -165,12 +165,12 @@ catch
     P = cell(0, 2);  D.hasParameters = false;
     warning('BEC:format', '%s has no Parameters sheet: L and Tc are taken from the Summary sheet.', D.name);
 end
-key = cellfun(@(c) char(string(c)), P(:, 1), 'UniformOutput', false);
+key = cellfun(@cellText, P(:, 1), 'UniformOutput', false);
 val = @(name) parameterValue(P, key, name);
 D.L = 1e-3 * cellNum(val('L_mm'));
 D.Tc = 1e-6 * cellNum(val('Tc_us'));
 D.refF = 1e3 * cellNum(val('ref_frequency_kHz'));
-D.dataType = char(string(val('DATA TYPE')));
+D.dataType = cellText(val('DATA TYPE'));
 D.nfScale = cellNum(val('near_field_scale'));
 D.variation = cellNum(val('random_variation'));
 if isnan(D.Tc) && has('L_over_lambda')                   % L/lambda = f (T_pp - Tc)
@@ -233,6 +233,15 @@ end
 function v = parameterValue(P, key, name)
 k = find(strcmp(key, name), 1);
 v = NaN;  if ~isempty(k), v = P{k, 2}; end
+end
+
+function s = cellText(c)
+% text of a spreadsheet cell; '' for an empty cell (readcell gives <missing>)
+s = '';
+if ischar(c), s = c;
+elseif isstring(c) && isscalar(c) && ~ismissing(c), s = char(c);
+elseif (isnumeric(c) || islogical(c)) && isscalar(c) && ~isnan(c), s = num2str(c);
+end
 end
 
 function v = cellNum(c)
@@ -387,7 +396,9 @@ for k = 1:numel(sets)
     p = sprintf('%s: %s', D.label, D.name);
     if ~D.hasParameters
         p = [p ', Parameters sheet missing (data type not recorded)'];                  %#ok<AGROW>
-    elseif ~isempty(D.dataType) && ~strcmpi(D.dataType, 'NaN')
+    elseif isempty(D.dataType) || strcmpi(D.dataType, 'NaN')
+        p = [p ', data type not recorded'];                                             %#ok<AGROW>
+    else
         p = [p ', ' D.dataType];                                                        %#ok<AGROW>
     end
     if isfinite(D.nfScale), p = sprintf('%s, near-field scale %g', p, D.nfScale); end
