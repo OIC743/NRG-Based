@@ -13,7 +13,7 @@
 %   (a) NT sweep: transmitted (dashed) and received (solid, band-pass
 %       filtered) signals at every frequency, as Figure 8 of
 %       BE_TravelTime_V6: Vs and L/lambda per trace, frequency labels,
-%       first-peak picks joined in orange, T_pp arrow on the test (sending)
+%       first-peak picks joined by a black line (yellow markers), T_pp arrow on the test (sending)
 %       frequency, near field marked on the lowest frequency
 %   (b) M-treated sweep, same layout
 %   (c) Vs relative to the test frequency (%) against the excitation
@@ -64,6 +64,17 @@ cfg.fontName        = 'Charis SIL';
 cfg.fontSize        = 8;                % pt, axis labels and titles (trace labels 1 pt smaller)
 cfg.widthMM         = 190;              % figure width, mm
 cfg.heightMM        = 200;              % figure height, mm
+% received-trace colours, lowest frequency first (RGB 0-255), used in rank order in (a) and (b);
+% sampled from the NTA-10 figure at 4, 8, 10, 14, 20 and 30 kHz. Its other traces, if wanted:
+% 6 kHz [69 42 123], 24 kHz [187 49 37], 28 kHz [121 92 36]
+cfg.traceColors     = [ 43  51 146;     % 4 kHz,  dark blue
+                       112  31  97;     % 8 kHz,  purple
+                       160  28  66;     % 10 kHz, maroon
+                       209  32  39;     % 14 kHz, red
+                       237  30  36;     % 20 kHz, bright red
+                        54 138  65];    % 30 kHz, green
+cfg.pickLineColor   = [0 0 0];          % line joining the received peaks
+cfg.pickMarkerColor = [1 1 0];          % fill of the peak markers (black edge)
 cfg.saveOutputs     = true;
 cfg.outputFile      = '';               % '' -> BE_CompareSweeps next to the M-treated workbook
 %% =========================================================================
@@ -101,16 +112,17 @@ set(fig, 'PaperUnits', 'centimeters', 'PaperSize', [cfg.widthMM cfg.heightMM] / 
 set(fig, 'DefaultAxesFontName', cfg.fontName, 'DefaultTextFontName', cfg.fontName, ...
     'DefaultAxesFontSize', cfg.fontSize, 'DefaultTextFontSize', cfg.fontSize);
 tl = tiledlayout(fig, 5, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+set(tl, 'Units', 'normalized', 'OuterPosition', [0 0.035 1 0.965]);  % bottom strip for the footnote
 plotSweep(nexttile(tl, 1, [3 1]), A, '(a)', cfg);
 plotSweep(nexttile(tl, 2, [3 1]), B, '(b)', cfg);
-axC = nexttile(tl, 7, [2 1]);
-hLeg = plotRelative(axC, {A, B}, 'f', cfg);
-plotRelative(nexttile(tl, 8, [2 1]), {A, B}, 'Rd', cfg);
-lg = legend(axC, hLeg.handles, hLeg.labels, 'Orientation', 'horizontal', 'Box', 'off');
-lg.Layout.Tile = 'north';
-annotation(fig, 'textbox', [0.01 0.002 0.98 0.02], 'String', provenance({A, B}), ...
+axC = nexttile(tl, 7, [2 1]);  axD = nexttile(tl, 8, [2 1]);
+hLegC = plotRelative(axC, {A, B}, 'f', cfg);
+hLegD = plotRelative(axD, {A, B}, 'Rd', cfg);
+legend(axC, hLegC.handles, hLegC.labels, 'Location', 'southeast', 'Box', 'on', 'FontSize', cfg.fontSize - 1);
+legend(axD, hLegD.handles, hLegD.labels, 'Location', 'southeast', 'Box', 'on', 'FontSize', cfg.fontSize - 1);
+annotation(fig, 'textbox', [0.01 0.002 0.98 0.032], 'String', provenance({A, B}), ...
     'EdgeColor', 'none', 'FontSize', max(5, cfg.fontSize - 2), 'Color', [0.35 0.35 0.35], ...
-    'Interpreter', 'none', 'HorizontalAlignment', 'left');
+    'Interpreter', 'none', 'HorizontalAlignment', 'left', 'VerticalAlignment', 'bottom');
 set(findall(fig, '-property', 'FontName'), 'FontName', cfg.fontName);
 closeEmptyFigures(figsBefore, fig);
 
@@ -153,6 +165,16 @@ for nm = {'ntTestFrequency', 'mTestFrequency'}
 end
 if ~(isnumeric(cfg.band) && isscalar(cfg.band) && cfg.band >= 0)
     error('BEC:opt', 'cfg.band must be a non-negative percentage.');
+end
+c = cfg.traceColors;
+if ~(isnumeric(c) && ismatrix(c) && size(c, 2) == 3 && size(c, 1) >= 2 && all(c(:) >= 0 & c(:) <= 255))
+    error('BEC:opt', 'cfg.traceColors must be an n x 3 list of RGB values 0-255 (n >= 2).');
+end
+for nm = {'pickLineColor', 'pickMarkerColor'}
+    c = cfg.(nm{1});
+    if ~(isnumeric(c) && numel(c) == 3 && all(c >= 0 & c <= 1))
+        error('BEC:opt', 'cfg.%s must be an RGB triplet with values 0-1.', nm{1});
+    end
 end
 for nm = {'widthMM', 'heightMM', 'fontSize'}
     v = cfg.(nm{1});
@@ -289,8 +311,8 @@ end
 function plotSweep(ax, D, letter, cfg)
 % stacked transmitted / received signals, one trace per frequency (Figure 8 style)
 hold(ax, 'on');
-n = numel(D.f);  cols = lines(n);  amp = 0.42;
-orange = [0.95 0.55 0.10];  magenta = [0.85 0 0.55];
+n = numel(D.f);  cols = traceColors(cfg.traceColors, n);  amp = 0.42;
+pickCol = cfg.pickLineColor;  magenta = [0.85 0 0.55];
 xmax = min(D.tms(end), max(D.tPeakRx_ms + 1.1e3 ./ D.f));        % end of the slowest received pulse
 [~, kT] = min(abs(D.f - D.fTest));                                % trace of the test (sending) frequency
 yPk = NaN(n, 1);
@@ -319,14 +341,15 @@ for k = 1:n
 end
 if strcmp(cfg.method, 'P2P')                             % first-peak picks joined across frequencies
     ok = isfinite(D.tPeakRx_ms) & isfinite(yPk);
-    plot(ax, D.tPeakRx_ms(ok), yPk(ok), '-o', 'Color', orange, 'MarkerFaceColor', orange, ...
-        'MarkerSize', 4, 'LineWidth', 1.3);
+    plot(ax, D.tPeakRx_ms(ok), yPk(ok), '-', 'Color', pickCol, 'LineWidth', 1.2);
+    plot(ax, D.tPeakRx_ms(ok), yPk(ok), 'o', 'MarkerEdgeColor', 'k', 'MarkerFaceColor', cfg.pickMarkerColor, ...
+        'MarkerSize', 5, 'LineWidth', 0.8);
 else                                                     % travel time of the method as a tick per trace
     tt = 1e3 * D.Ts;  ok = isfinite(tt);
     for k = find(ok).'
-        plot(ax, [tt(k) tt(k)], k - 1 + [-0.3 0.3], '-', 'Color', orange, 'LineWidth', 1.6);
+        plot(ax, [tt(k) tt(k)], k - 1 + [-0.3 0.3], '-', 'Color', pickCol, 'LineWidth', 1.6);
     end
-    plot(ax, tt(ok), find(ok) - 1, '-', 'Color', orange, 'LineWidth', 1.0);
+    plot(ax, tt(ok), find(ok) - 1, '-', 'Color', pickCol, 'LineWidth', 1.0);
 end
 % T_pp arrow on the test-frequency trace
 if isfinite(D.tPeakTx_ms(kT)) && isfinite(D.tPeakRx_ms(kT))
@@ -351,6 +374,19 @@ xlabel(ax, 'Time from transmitter start (ms)');
 ylabel(ax, 'Transmitted (dashed) / received (solid), normalised');
 title(ax, sprintf('%s %s (test at %g kHz)', letter, D.label, D.fTest / 1e3), ...
     'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'Units', 'normalized', 'Position', [0 1.005 0]);
+end
+
+function c = traceColors(rgb, n)
+% n colours from the cfg.traceColors list (0-255), lowest frequency first: the list
+% itself when n matches, evenly spaced entries when n is smaller, interpolated when larger
+rgb = double(rgb) / 255;  m = size(rgb, 1);
+if n == m
+    c = rgb;
+elseif n < m
+    c = rgb(round(linspace(1, m, n)), :);
+else
+    c = interp1(linspace(0, 1, m), rgb, linspace(0, 1, n));
+end
 end
 
 function hLeg = plotRelative(ax, sets, xKind, cfg)
@@ -412,7 +448,7 @@ if strcmp(xKind, 'f')
 else
     if ~isempty(cfg.rdLine) && cfg.rdLine >= xl(1) && cfg.rdLine <= xl(2)
         xline(ax, cfg.rdLine, '--k', sprintf('R_d = %g', cfg.rdLine), 'LineWidth', 1.0, ...
-            'LabelVerticalAlignment', 'bottom', 'LabelOrientation', 'horizontal', 'HandleVisibility', 'off');
+            'LabelVerticalAlignment', 'middle', 'LabelOrientation', 'horizontal', 'HandleVisibility', 'off');  % legend sits bottom right
     end
     xlabel(ax, 'Wavelengths between the tips, R_d = L_{tt} f / V_s');
     title(ax, '(d) Same data versus R_d (stars: test frequencies)', 'FontWeight', 'bold', ...
@@ -444,7 +480,7 @@ for k = 1:numel(sets)
     end
     parts{k} = p;
 end
-s = ['Data: ' strjoin(parts, '   |   ')];
+s = ['Data: ' strjoin(parts, [newline 'Data: '])];   % one line per workbook, so it fits the width
 end
 
 % =========================================================================
