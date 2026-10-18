@@ -185,6 +185,9 @@ D.tPeakRx_ms = num('rx_peak_ms');  D.aPeakRxNorm = num('rx_peak_norm');  D.tPeak
 D.tP_ms = NaN(n, 1);    if has('P_arrival_ms'), D.tP_ms = num('P_arrival_ms'); end
 D.tS2S_ms = NaN(n, 1);  if has('S2S_arrival_ms'), D.tS2S_ms = num('S2S_arrival_ms'); end
 D.bump = zeros(n, 1);   if has('first_bump_ratio'), D.bump = num('first_bump_ratio'); end
+if has('near_field_start_ms') && has('near_field_end_ms')   % measured workbooks (BE_SweepToWorkbook)
+    D.tP_ms = num('near_field_start_ms');  D.tS2S_ms = num('near_field_end_ms');
+end
 % parameters (sheet may be missing, e.g. after editing the workbook)
 D.hasParameters = true;
 try
