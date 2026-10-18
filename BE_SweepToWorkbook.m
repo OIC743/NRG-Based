@@ -34,6 +34,22 @@
 %  from the transmitter start to the end of the shortest record (linear
 %  interpolation, for plotting only - all travel times come from the
 %  original samples). The receiver is stored with the polarity used.
+%
+%  RECEIVER SHIFT TO A TARGET Vs (cfg.targetVs, [] = off): for every
+%  frequency listed, the receiver record is moved in time (cubic-spline
+%  resampling, the uncovered part set to zero) until the peak-to-peak
+%  travel time is L / Vs_target + Tc, so Vs_PP equals Vs_target. The
+%  transmitter is not changed. All methods are then evaluated on the moved
+%  receiver (they move with it); noise, SNR and the crosstalk check still
+%  come from the recorded receiver. The shift, the recorded T_pp and the recorded Vs_PP
+%  are kept in the Summary sheet (rx_shift_us, Ts_PP_recorded_us,
+%  Vs_PP_recorded_m_s), DATA TYPE reads 'MEASURED, RECEIVER SHIFTED TO
+%  TARGET Vs' and user_entered = 1 marks these frequencies, so
+%  BE_CompareSweeps labels them (*). Shifted Vs values are therefore inputs,
+%  not measurements of this record.
+%  L/lambda = L f / Vs follows from L and the target Vs; with
+%  cfg.targetLoverLambda given, the computed values are compared with them
+%  and the range of L that reproduces all of them is printed.
 %  =========================================================================
 
 %% ============================ USER SETTINGS ==============================
@@ -51,6 +67,13 @@ cfg.filterType     = 'none';            % data supplied filtered; 'fft' to band-
 cfg.minTravelTime  = 0;                 % s, nothing earlier is picked (crosstalk)
 cfg.maxTravelTime  = [];                % s, [] -> end of the record
 cfg.outputFile     = '';                % '' -> <sweep>_BE.xlsx next to the input
+% target Vs per frequency, [f_kHz  Vs_m/s] (here: the NTA-10 figure); the receiver is
+% shifted so that Vs_PP equals these. [] -> no shift. Frequencies not in the sweep are ignored.
+cfg.targetVs = [ 4 104.93;  6 108.11;  8 113.35;  10 119.67;  14 124.26;
+                20 126.07; 24 127.01; 28 127.21;  30 127.51];
+% optional check only: L/lambda of the same figure, [f_kHz  L/lambda] ([] -> no check)
+cfg.targetLoverLambda = [ 4 0.78;  6 1.14;  8 1.45;  10 1.72;  14 2.31;
+                         20 3.26; 24 3.88; 28 4.52;  30 4.83];
 %% =========================================================================
 
 if isempty(sweepFile)
@@ -98,7 +121,30 @@ R = cell(n, 1);
 for k = 1:n
     R{k} = analysePair(sw(k).t, sw(k).x, sw(k).y, opts);
 end
+
+% ---- 4b. receiver shift to the target Vs ----------------------------------------
+sh = struct('d', zeros(n, 1), 'TsRec', NaN(n, 1), 'VsRec', NaN(n, 1), 'VsTarget', NaN(n, 1), ...
+    'on', false(n, 1), 'resid', NaN(n, 1));
+for k = 1:n
+    sh.TsRec(k) = methodTs(R{k}, 'P2P');
+    sh.VsRec(k) = R{k}.methods(strcmp({R{k}.methods.tag}, 'P2P')).Vs;
+end
+if ~isempty(cfg.targetVs)
+    fT = cfg.targetVs(:, 1);
+    for k = 1:n
+        j = find(abs(fT - sw(k).fNominal) < 1e-6, 1);
+        if isempty(j), continue; end
+        sh.VsTarget(k) = cfg.targetVs(j, 2);
+        [R{k}, sh.d(k), sh.resid(k)] = shiftToTarget(sw(k), R{k}, cfg.L / sh.VsTarget(k) + cfg.Tc, opts);
+        sh.on(k) = true;
+    end
+    unused = setdiff(fT, [sw.fNominal]);
+    if ~isempty(unused)
+        fprintf('Target Vs given for %s kHz: not in the sweep, ignored.\n', mat2str(unused.'));
+    end
+end
 res = collectResults(sw, R, cfg, vote, margin);
+res.shift = sh;
 printResults(res, sw, pol, polBasis, cfg, 1);
 
 % ---- 5. comparison workbook ---------------------------------------------------
@@ -148,7 +194,7 @@ function opts = analysisOptions(cfg)
 opts = struct('rxPolarity', 1, 'filterType', lower(cfg.filterType), 'filterBand', [], ...
     'filterBandFactor', [0.25 4], 'butterOrder', 4, 'minTravelTime', cfg.minTravelTime, ...
     'maxTravelTime', cfg.maxTravelTime, 'ampFrac', 0.25, 'noiseK', 4, 'minSNR', 10, ...
-    'L', cfg.L, 'H_i', [], 'dH_c', 0, 'H_b', [], 'Tc', cfg.Tc, 'rho', []);
+    'L', cfg.L, 'H_i', [], 'dH_c', 0, 'H_b', [], 'Tc', cfg.Tc, 'rho', [], 'noiseRef', []);
 if ~ismember(opts.filterType, {'none', 'fft', 'butter'})
     error('BEW:opt', 'cfg.filterType must be ''none'', ''fft'' or ''butter''.');
 end
@@ -176,10 +222,15 @@ y  = opts.rxPolarity * y;
 yr = opts.rxPolarity * yr;
 F.nSmooth = max(1, round(0.05 * T.period / dt));
 ys = movingMean(yr, F.nSmooth);
-F.noiseRaw    = robustStd(yr(iPre));
-F.noiseFilt   = max(robustStd(y(iPre)), F.noiseRaw * sqrt(mean(F.H.^2)));
-F.noiseSmooth = max(robustStd(ys(iPre)), F.noiseRaw * sqrt(1/F.nSmooth + 1/nnz(iPre)));
-X = crosstalkCheck(t, x, ys, T, F, opts);
+yn = yr;  ynF = y;  ynS = ys;                       % noise and crosstalk from this record, or
+if ~isempty(opts.noiseRef)                          % from the recorded receiver when it was shifted
+    yn = opts.noiseRef - mean(opts.noiseRef(iPre));
+    ynF = filterReceiver(yn, fs, f0, opts);  ynS = movingMean(yn, F.nSmooth);
+end
+F.noiseRaw    = robustStd(yn(iPre));
+F.noiseFilt   = max(robustStd(ynF(iPre)), F.noiseRaw * sqrt(mean(F.H.^2)));
+F.noiseSmooth = max(robustStd(ynS(iPre)), F.noiseRaw * sqrt(1/F.nSmooth + 1/nnz(iPre)));
+X = crosstalkCheck(t, x, ynS, T, F, opts);        % crosstalk: a property of the recording
 P = pickReceiver(t, y, yr, ys, T, F, opts);
 sigOK = P.snr >= opts.minSNR;
 M = struct('name', {}, 'tag', {}, 'basis', {}, 'Ts', {}, 'quality', {}, 'note', {});
@@ -207,6 +258,40 @@ end
 M = addVelocity(M, opts, f0, P.fPeakTrough);
 R = struct('transmitter', T, 'filter', F, 'crosstalk', X, 'picks', P, 'cc', C, 'methods', M, ...
     'signals', struct('t', t, 'tx', x, 'rxRaw', yr, 'rxFiltered', y));
+end
+
+function [R, d, resid] = shiftToTarget(s, R0, TsTarget, opts)
+% receiver moved by d (s, positive = later) so that the peak-to-peak travel time is
+% TsTarget; the uncovered part is zero, noise is taken from the recorded receiver
+iPre = s.t < R0.transmitter.tStart;
+y0 = s.y - mean(s.y(iPre));
+o = opts;  o.noiseRef = y0;
+d = 0;  ts = methodTs(R0, 'P2P');  R = R0;  dPrev = [];
+if ~isfinite(ts), error('BEW:shift', '%s: no peak-to-peak travel time to shift from.', s.label); end
+for it = 1:30
+    slope = 1;                                      % secant step: on a broad crest the refined
+    if ~isempty(dPrev) && d ~= dPrev                % peak moves faster or slower than the shift
+        slope = (ts - tsPrev) / (d - dPrev);
+        if ~(slope > 0.2 && slope < 5), slope = 1; end
+    end
+    dPrev = d;  tsPrev = ts;
+    d = d + (TsTarget - ts) / slope;
+    R = analysePair(s.t, s.x, interp1(s.t, y0, s.t - d, 'spline', 0), o);
+    ts = methodTs(R, 'P2P');
+    if ~isfinite(ts), error('BEW:shift', '%s: the peak is lost after a shift of %.2f us.', s.label, 1e6 * d); end
+    if abs(TsTarget - ts) < 1e-11, break; end
+end
+resid = ts - TsTarget;
+if abs(resid) > 1e-9
+    warning('BEW:shift', '%s: target travel time reached within %.3g us only.', s.label, 1e6 * abs(resid));
+end
+if abs(R.picks.aPeak1 / R0.picks.aPeak1 - 1) > 0.05
+    warning('BEW:shift', ['%s: after the shift a different receiver peak is picked (amplitude %.3g, ' ...
+        'recorded pick %.3g).'], s.label, R.picks.aPeak1, R0.picks.aPeak1);
+end
+if d < 0 && R0.picks.tPeak1 + d < R0.transmitter.tStart
+    warning('BEW:shift', '%s: the shift moves the recorded peak before the transmitter start.', s.label);
+end
 end
 
 function [v, m] = polarityVote(C, opts)
@@ -269,6 +354,44 @@ for k = 1:numel(res.f)
 end
 fprintf(fid, ['vote: +1/-1 = sign of the largest cross-correlation excursion (polarity as recorded); ' ...
     'NF = near-field excursion / first peak (0 = none confirmed)\n\n']);
+sh = res.shift;
+if any(sh.on)
+    fprintf(fid, 'Receiver shifted to the target Vs (values above are after the shift):\n');
+    fprintf(fid, '%7s %11s %11s %10s %11s %9s %9s\n', 'f kHz', 'T_pp rec us', 'Vs_pp rec', 'shift us', ...
+        'T_pp now us', 'Vs_pp', 'target');
+    for k = find(sh.on).'
+        fprintf(fid, '%7.2f %11.2f %11.2f %+10.2f %11.4f %9.4f %9.2f\n', res.fNominal(k), 1e6 * sh.TsRec(k), ...
+            sh.VsRec(k), 1e6 * sh.d(k), 1e6 * res.Ts(k, 2), res.Vs(k, 2), sh.VsTarget(k));
+    end
+    fprintf(fid, '\n');
+end
+if ~isempty(cfg.targetLoverLambda)
+    checkLoverLambda(res, cfg, fid);
+end
+end
+
+function checkLoverLambda(res, cfg, fid)
+% L/lambda = L f / Vs against the given values (taken as rounded to 2 decimals)
+G = cfg.targetLoverLambda;  lo = -Inf;  hi = Inf;  bad = 0;  m = 0;
+fprintf(fid, 'L/lambda check (L = %.3f mm):\n%7s %10s %8s %8s\n', 1e3 * cfg.L, 'f kHz', 'computed', 'given', 'match');
+for k = 1:numel(res.f)
+    j = find(abs(G(:, 1) - res.fNominal(k)) < 1e-6, 1);
+    if isempty(j) || ~isfinite(res.Vs(k, 2)), continue; end
+    m = m + 1;
+    ok = abs(round(100 * res.LL(k)) - round(100 * G(j, 2))) < 0.5;  bad = bad + ~ok;
+    fprintf(fid, '%7.2f %10.4f %8.2f %8s\n', res.fNominal(k), res.LL(k), G(j, 2), ternary(ok, 'yes', 'NO'));
+    Lk = res.Vs(k, 2) / (1e3 * res.f(k));                   % L per unit L/lambda at this Vs and f
+    lo = max(lo, (G(j, 2) - 0.005) * Lk);  hi = min(hi, (G(j, 2) + 0.005) * Lk);
+end
+if m == 0, return; end
+if bad == 0
+    fprintf(fid, 'All %d L/lambda values match.\n\n', m);
+elseif lo <= hi
+    fprintf(fid, ['%d of %d L/lambda values differ. With these Vs, every given L/lambda is reproduced ' ...
+        'for %.3f mm <= L <= %.3f mm (cfg.L).\n\n'], bad, m, 1e3 * lo, 1e3 * hi);
+else
+    fprintf(fid, '%d of %d L/lambda values differ, and no single L reproduces all of them with these Vs.\n\n', bad, m);
+end
 end
 
 function writeSweepWorkbook(file, sw, R, res, cfg, pol, polBasis, source)
@@ -278,10 +401,13 @@ n = numel(sw);  tags = res.tags;
 hdr = [{'f_kHz', 'f_tx_measured_kHz', 'L_over_lambda'}, strcat('Ts_', tags, '_us'), ...
        {'Vs_PP_m_s', 'Vs_S2S_m_s', 'Vs_CC_m_s', 'user_entered'}, strcat('quality_', tags), ...
        {'rx_peak_ms', 'rx_peak_norm', 'tx_peak_ms', 'P_arrival_ms', 'S2S_arrival_ms', 'first_bump_ratio', ...
-        'near_field_start_ms', 'near_field_end_ms', 'snr', 'crosstalk', 'polarity_vote', 'polarity_margin'}];
+        'near_field_start_ms', 'near_field_end_ms', 'snr', 'crosstalk', 'polarity_vote', 'polarity_margin', ...
+        'rx_shift_us', 'Ts_PP_recorded_us', 'Vs_PP_recorded_m_s', 'Vs_target_m_s'}];
+sh = res.shift;
 body = [num2cell([res.f, res.fMeasured, res.LL, 1e6 * res.Ts, res.Vs(:, 2), res.Vs(:, 1), res.Vs(:, 4), ...
-        zeros(n, 1)]), res.quality, num2cell([res.rxPeak_ms, res.rxPeakNorm, res.txPeak_ms, NaN(n, 1), ...
-        res.s2s_ms, res.bump, res.nfStart_ms, res.nfEnd_ms, res.snr, double(res.crosstalk), res.vote, res.margin])];
+        double(sh.on)]), res.quality, num2cell([res.rxPeak_ms, res.rxPeakNorm, res.txPeak_ms, NaN(n, 1), ...
+        res.s2s_ms, res.bump, res.nfStart_ms, res.nfEnd_ms, res.snr, double(res.crosstalk), res.vote, res.margin, ...
+        1e6 * sh.d, 1e6 * sh.TsRec, sh.VsRec, sh.VsTarget])];
 writecell(nanToEmpty([hdr; body]), file, 'Sheet', 'Summary');
 % waveforms and cross-correlations on one grid (time from each transmitter start)
 dtc = min([sw.dt]);
@@ -306,13 +432,20 @@ end
 writecell(ch, file, 'Sheet', 'CrossCorrelation', 'Range', 'A1');
 writematrix(Cc, file, 'Sheet', 'CrossCorrelation', 'Range', 'A2');
 testF = [];  if ~isempty(cfg.testFrequency), testF = cfg.testFrequency; end
+dataType = 'MEASURED';  shiftNote = 'none: receivers as recorded';
+if any(sh.on)
+    dataType = 'MEASURED, RECEIVER SHIFTED TO TARGET Vs';
+    shiftNote = sprintf(['receiver moved by rx_shift_us at %d of %d frequencies so that Vs_PP = Vs_target; ' ...
+        'all travel times move with it; recorded values: Ts_PP_recorded_us, Vs_PP_recorded_m_s'], nnz(sh.on), n);
+end
 par = {'item', 'value', 'note';
-    'DATA TYPE', 'MEASURED', 'analysed with the BE_TravelTime_V6 methods by BE_SweepToWorkbook';
+    'DATA TYPE', dataType, 'analysed with the BE_TravelTime_V6 methods by BE_SweepToWorkbook';
+    'receiver_shift', ternary(any(sh.on), 'yes', 'no'), shiftNote;
     'source', source, 'measured sweep workbook';
     'L_mm', 1e3 * cfg.L, 'travel length tip to tip';
     'Tc_us', 1e6 * cfg.Tc, 'system time delay';
     'ref_frequency_kHz', testF, 'test frequency (empty: set in BE_CompareSweeps)';
-    'waveform_columns', 3, 'per frequency in Waveforms: tx, rx, rx as analysed (same: no filter)';
+    'waveform_columns', 3, 'per frequency in Waveforms: tx, rx, rx as analysed (same: no filter; shifted if receiver_shift)';
     'receiver_polarity', pol, polBasis;
     'filter', cfg.filterType, 'data supplied filtered';
     'frequency_basis', cfg.frequencyBasis, 'f_kHz: nominal (column titles) or measured transmitter';

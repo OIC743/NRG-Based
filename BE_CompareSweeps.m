@@ -437,7 +437,11 @@ for k = 1:numel(sets)
     if isfinite(D.nfScale), p = sprintf('%s, near-field scale %g', p, D.nfScale); end
     if isfinite(D.variation) && D.variation > 0, p = sprintf('%s, wave variation %g %%', p, 100 * D.variation); end
     nU = nnz(D.userSet);
-    if nU > 0, p = sprintf('%s, T_pp entered by the user at %d of %d frequencies (*)', p, nU, numel(D.f)); end
+    if nU > 0 && contains(upper(D.dataType), 'SHIFTED')
+        p = sprintf('%s at %d of %d frequencies (*)', p, nU, numel(D.f));                 %#ok<AGROW>
+    elseif nU > 0
+        p = sprintf('%s, T_pp entered by the user at %d of %d frequencies (*)', p, nU, numel(D.f)); %#ok<AGROW>
+    end
     parts{k} = p;
 end
 s = ['Data: ' strjoin(parts, '   |   ')];
