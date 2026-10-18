@@ -36,11 +36,16 @@
 %  frequency must be set below, and the footnote says that the sheet - and
 %  with it the recorded data type - is missing.
 %
-%  OUTPUT: the figure, plus <outputFile>.png (600 dpi), .pdf (vector) and
-%  .csv (the plotted numbers) when saveOutputs is true.
+%  OUTPUT: the figure, cfg.widthMM wide (default 190 mm), plus, when
+%  saveOutputs is true, <outputFile>.eps (vector, for Adobe Illustrator),
+%  .pdf (vector), .png (600 dpi) - all exactly widthMM x heightMM - and
+%  .csv (the plotted numbers). Nothing is transparent, so the EPS stays
+%  fully vector.
 %  Font: Charis SIL (free, SIL International); if it is not installed,
-%  MATLAB substitutes another font and a warning says so.
-%  Requires MATLAB R2023a or later (yregion).
+%  MATLAB substitutes another font and a warning says so. The EPS refers to
+%  the font by name: Illustrator needs Charis SIL installed to show and
+%  edit the text in it.
+%  Requires MATLAB R2022a or later (print -vector).
 %  =========================================================================
 
 %% ============================ USER SETTINGS ==============================
@@ -56,12 +61,15 @@ cfg.method          = 'P2P';            % travel time behind Vs: 'P2P' | 'S2S' |
 cfg.band            = 2;                % % half-width of the grey band in (c) and (d)
 cfg.rdLine          = 2;                % R_d of the dashed line in (d) ([] = none)
 cfg.fontName        = 'Charis SIL';
-cfg.fontSize        = 10;
+cfg.fontSize        = 8;                % pt, axis labels and titles (trace labels 1 pt smaller)
+cfg.widthMM         = 190;              % figure width, mm
+cfg.heightMM        = 200;              % figure height, mm
 cfg.saveOutputs     = true;
 cfg.outputFile      = '';               % '' -> BE_CompareSweeps next to the M-treated workbook
 %% =========================================================================
 
 cfg = checkSettings(cfg);
+figsBefore = findall(groot, 'Type', 'figure');           % to remove any empty figure left behind
 if isempty(ntFile)
     [f, p] = uigetfile({'*.xlsx', 'Calibration workbook (*.xlsx)'}, ['Select the ' cfg.ntLabel ' workbook']);
     if isequal(f, 0), disp('No workbook selected - cancelled.'); return; end
@@ -86,8 +94,10 @@ if ~fontOk
     warning('BEC:font', ['Font "%s" is not installed; MATLAB uses another font. Install it ' ...
         '(free from SIL International) and restart MATLAB.'], cfg.fontName);
 end
-fig = figure('Name', 'NT vs M-treated frequency sweeps', 'Color', 'w', 'Units', 'pixels', ...
-    'Position', [40 40 1500 1350]);
+fig = figure('Name', 'NT vs M-treated frequency sweeps', 'Color', 'w', 'Units', 'centimeters', ...
+    'Position', [2 2 cfg.widthMM / 10 cfg.heightMM / 10]);
+set(fig, 'PaperUnits', 'centimeters', 'PaperSize', [cfg.widthMM cfg.heightMM] / 10, ...
+    'PaperPosition', [0 0 cfg.widthMM cfg.heightMM] / 10, 'InvertHardcopy', 'off');
 set(fig, 'DefaultAxesFontName', cfg.fontName, 'DefaultTextFontName', cfg.fontName, ...
     'DefaultAxesFontSize', cfg.fontSize, 'DefaultTextFontSize', cfg.fontSize);
 tl = tiledlayout(fig, 5, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
@@ -98,25 +108,37 @@ hLeg = plotRelative(axC, {A, B}, 'f', cfg);
 plotRelative(nexttile(tl, 8, [2 1]), {A, B}, 'Rd', cfg);
 lg = legend(axC, hLeg.handles, hLeg.labels, 'Orientation', 'horizontal', 'Box', 'off');
 lg.Layout.Tile = 'north';
-annotation(fig, 'textbox', [0.01 0.002 0.98 0.025], 'String', provenance({A, B}), ...
-    'EdgeColor', 'none', 'FontSize', cfg.fontSize - 2, 'Color', [0.35 0.35 0.35], ...
+annotation(fig, 'textbox', [0.01 0.002 0.98 0.02], 'String', provenance({A, B}), ...
+    'EdgeColor', 'none', 'FontSize', max(5, cfg.fontSize - 2), 'Color', [0.35 0.35 0.35], ...
     'Interpreter', 'none', 'HorizontalAlignment', 'left');
 set(findall(fig, '-property', 'FontName'), 'FontName', cfg.fontName);
+closeEmptyFigures(figsBefore, fig);
 
 % ---- report and files -----------------------------------------------------
 printComparison({A, B}, cfg, 1);
 if cfg.saveOutputs
     out = cfg.outputFile;
     if isempty(out), out = fullfile(fileparts(mFile), 'BE_CompareSweeps'); end
-    exportgraphics(fig, [out '.png'], 'Resolution', 600);
-    exportgraphics(fig, [out '.pdf'], 'ContentType', 'vector');
+    % print uses the paper size set above, so every file is exactly widthMM x heightMM
+    print(fig, [out '.eps'], '-depsc', '-vector');
+    print(fig, [out '.pdf'], '-dpdf', '-vector');
+    print(fig, [out '.png'], '-dpng', '-r600');
     writeComparisonCsv({A, B}, cfg, [out '.csv']);
-    fprintf('Saved: %s.png, .pdf, .csv\n', out);
+    fprintf('Saved (%g x %g mm): %s.eps, .pdf, .png, .csv\n', cfg.widthMM, cfg.heightMM, out);
+    closeEmptyFigures(figsBefore, fig);
 end
 
 % =========================================================================
 %                              SETTINGS AND DATA
 % =========================================================================
+function closeEmptyFigures(figsBefore, keep)
+% close figures that appeared while the script ran but hold nothing
+for h = reshape(findall(groot, 'Type', 'figure'), 1, [])
+    if isequal(h, keep) || any(figsBefore == h), continue; end
+    if isempty(h.Children), close(h); end
+end
+end
+
 function cfg = checkSettings(cfg)
 tags = {'P2P', 'S2S', 'T2T', 'CC', 'ECC', 'CPS'};
 cfg.method = upper(cfg.method);
@@ -131,6 +153,12 @@ for nm = {'ntTestFrequency', 'mTestFrequency'}
 end
 if ~(isnumeric(cfg.band) && isscalar(cfg.band) && cfg.band >= 0)
     error('BEC:opt', 'cfg.band must be a non-negative percentage.');
+end
+for nm = {'widthMM', 'heightMM', 'fontSize'}
+    v = cfg.(nm{1});
+    if ~(isnumeric(v) && isscalar(v) && v > 0)
+        error('BEC:opt', 'cfg.%s must be a positive number.', nm{1});
+    end
 end
 end
 
@@ -277,12 +305,14 @@ for k = 1:n
     if isfinite(D.tPeakRx_ms(k)) && isfinite(yPk(k))
         text(ax, D.tPeakRx_ms(k) + 0.02 * xmax, yPk(k) + 0.06, lab, 'Color', cols(k, :), 'FontSize', cfg.fontSize - 1);
     end
-    text(ax, 0.985 * xmax, off - 0.24, sprintf('L/\\lambda = %.2f', D.f(k) * (D.TsPP(k) - D.Tc)), ...
-        'HorizontalAlignment', 'right', 'FontSize', cfg.fontSize - 1);
-    fLab = sprintf('%g\n(kHz)', D.f(k) / 1e3);
-    if k == kT, fLab = sprintf('%g\n(kHz)\ntest', D.f(k) / 1e3); end
-    text(ax, 1.01 * xmax, off, fLab, 'Color', cols(k, :), 'FontWeight', 'bold', ...
-        'FontSize', cfg.fontSize, 'Clipping', 'off');
+    % frequency above and L/lambda below the trace, inside the panel at its right edge
+    % (labels outside the axes would run into the neighbouring panel at 190 mm width)
+    fLab = sprintf('%g kHz', D.f(k) / 1e3);
+    if k == kT, fLab = [fLab ' (test)']; end                                       %#ok<AGROW>
+    text(ax, 0.99 * xmax, off + 0.17, fLab, 'Color', cols(k, :), 'FontWeight', 'bold', ...
+        'HorizontalAlignment', 'right', 'FontSize', cfg.fontSize, 'BackgroundColor', 'w', 'Margin', 0.5);
+    text(ax, 0.99 * xmax, off - 0.22, sprintf('L/\\lambda = %.2f', D.f(k) * (D.TsPP(k) - D.Tc)), ...
+        'HorizontalAlignment', 'right', 'FontSize', cfg.fontSize - 1, 'BackgroundColor', 'w', 'Margin', 0.5);
 end
 if strcmp(cfg.method, 'P2P')                             % first-peak picks joined across frequencies
     ok = isfinite(D.tPeakRx_ms) & isfinite(yPk);
@@ -315,8 +345,8 @@ end
 xlim(ax, [0 xmax]);  ylim(ax, [-0.6, max(n - 0.35, kT - 1 + amp + 0.35)]);   % room for the T_pp arrow
 set(ax, 'YTick', [], 'TickDir', 'in', 'Box', 'on');
 xlabel(ax, 'Time from transmitter start (ms)');
-ylabel(ax, 'Transmitted (dashed) and received (solid) signals, normalised');
-title(ax, sprintf('%s %s: test (sending) frequency %g kHz', letter, D.label, D.fTest / 1e3), ...
+ylabel(ax, 'Transmitted (dashed) / received (solid), normalised');
+title(ax, sprintf('%s %s (test at %g kHz)', letter, D.label, D.fTest / 1e3), ...
     'FontWeight', 'bold', 'HorizontalAlignment', 'left', 'Units', 'normalized', 'Position', [0 1.005 0]);
 end
 
@@ -330,9 +360,9 @@ for s = 1:numel(sets)
     xAll = [xAll; x(isfinite(x))];                                                 %#ok<AGROW>
 end
 xl = [min(xAll) / 1.15, max(xAll) * 1.15];
-if cfg.band > 0
-    yregion(ax, -cfg.band, cfg.band, 'FaceColor', [0.85 0.85 0.85], 'FaceAlpha', 0.55, ...
-        'EdgeColor', 'none', 'HandleVisibility', 'off');
+bandColor = [0.91 0.91 0.91];                           % opaque: EPS cannot store transparency
+if cfg.band > 0                                          % drawn first, so it lies under the data
+    patch(ax, xl([1 2 2 1]), cfg.band * [-1 -1 1 1], bandColor, 'EdgeColor', 'none', 'HandleVisibility', 'off');
 end
 yline(ax, 0, '-', 'Color', [0.45 0.45 0.45], 'LineWidth', 0.8, 'HandleVisibility', 'off');
 hLeg.handles = gobjects(0);  hLeg.labels = {};
@@ -341,29 +371,29 @@ for s = 1:numel(sets)
     D = sets{s};
     if strcmp(xKind, 'f'), x = D.f / 1e3; xT = D.fTest / 1e3; else, x = D.Rd; xT = D.RdTest; end
     g = D.ok & isfinite(x) & isfinite(D.rel);
-    h = plot(ax, x(g), D.rel(g), ['-' D.marker], 'Color', D.color, 'LineWidth', 1.5, ...
-        'MarkerSize', 8, 'MarkerFaceColor', D.color, 'MarkerEdgeColor', 0.6 * D.color);
+    h = plot(ax, x(g), D.rel(g), ['-' D.marker], 'Color', D.color, 'LineWidth', 1.2, ...
+        'MarkerSize', 5, 'MarkerFaceColor', D.color, 'MarkerEdgeColor', 0.6 * D.color);
     hLeg.handles(end+1) = h;
     hLeg.labels{end+1} = sprintf('%s (test at %g kHz)', D.label, D.fTest / 1e3);
     bad = ~D.ok & isfinite(x) & isfinite(D.rel);
     if any(bad)
-        plot(ax, x(bad), D.rel(bad), 'o', 'Color', [0.55 0.55 0.55], 'MarkerSize', 8, 'LineWidth', 1.2, ...
+        plot(ax, x(bad), D.rel(bad), 'o', 'Color', [0.55 0.55 0.55], 'MarkerSize', 5, 'LineWidth', 1.0, ...
             'HandleVisibility', 'off');
         anyExcluded = true;
     end
     if strcmp(xKind, 'f')
         xline(ax, xT, ':', 'Color', D.color, 'LineWidth', 1.3, 'HandleVisibility', 'off');
     else
-        plot(ax, xT, 0, 'p', 'MarkerSize', 16, 'MarkerFaceColor', D.color, 'MarkerEdgeColor', 'k', ...
+        plot(ax, xT, 0, 'p', 'MarkerSize', 10, 'MarkerFaceColor', D.color, 'MarkerEdgeColor', 'k', ...
             'LineWidth', 0.8, 'HandleVisibility', 'off');
     end
 end
 if anyExcluded
-    hLeg.handles(end+1) = plot(ax, NaN, NaN, 'o', 'Color', [0.55 0.55 0.55], 'MarkerSize', 8, 'LineWidth', 1.2);
+    hLeg.handles(end+1) = plot(ax, NaN, NaN, 'o', 'Color', [0.55 0.55 0.55], 'MarkerSize', 5, 'LineWidth', 1.0);
     hLeg.labels{end+1} = 'excluded (quality \neq ok)';
 end
 if cfg.band > 0
-    hLeg.handles(end+1) = patch(ax, NaN, NaN, [0.85 0.85 0.85], 'EdgeColor', 'none');
+    hLeg.handles(end+1) = patch(ax, NaN, NaN, bandColor, 'EdgeColor', 'none');
     hLeg.labels{end+1} = sprintf('\\pm%g %% band', cfg.band);
 end
 set(ax, 'XScale', 'log', 'TickDir', 'in', 'Box', 'on', 'XMinorTick', 'on', 'YMinorTick', 'on');
